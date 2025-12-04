@@ -80,6 +80,11 @@ _LIBZFS_CORE_H int lzc_release(nvlist_t *, nvlist_t **);
 _LIBZFS_CORE_H int lzc_get_holds(const char *, nvlist_t **);
 _LIBZFS_CORE_H int lzc_get_props(const char *, nvlist_t **);
 
+_LIBZFS_CORE_H int lzc_list_datasets_bulk(const char *, uint64_t, uint64_t,
+    boolean_t, nvlist_t **, uint64_t *);
+_LIBZFS_CORE_H int lzc_list_snapshots_bulk(const char *, uint64_t, uint64_t,
+    boolean_t, uint64_t, uint64_t, nvlist_t **, uint64_t *);
+
 enum lzc_send_flags {
 	LZC_SEND_FLAG_EMBED_DATA = 1 << 0,
 	LZC_SEND_FLAG_LARGE_BLOCK = 1 << 1,

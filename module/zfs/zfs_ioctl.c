@@ -2483,6 +2483,274 @@ zfs_ioc_snapshot_list_next(zfs_cmd_t *zc)
 	return (error);
 }
 
+/*
+ * Bulk dataset listing - returns multiple child datasets in a single call.
+ *
+ * innvl: {
+ *     "cursor" -> uint64_t (zap cursor, 0 to start)
+ *     "max_count" -> uint64_t (max datasets to return, default 1000)
+ *     "simple" -> boolean (skip properties if true)
+ * }
+ *
+ * outnvl: {
+ *     "next_cursor" -> uint64_t (cursor for next call, UINT64_MAX if done)
+ *     "datasets" -> {
+ *         "child_name1" -> { "stats" -> dmu_objset_stats_t as uint8 array },
+ *         "child_name2" -> { ... },
+ *         ...
+ *     }
+ * }
+ */
+static const zfs_ioc_key_t zfs_keys_dataset_list_bulk[] = {
+	{"cursor",	DATA_TYPE_UINT64,	0},
+	{"max_count",	DATA_TYPE_UINT64,	ZK_OPTIONAL},
+	{"simple",	DATA_TYPE_BOOLEAN_VALUE, ZK_OPTIONAL},
+};
+
+static int
+zfs_ioc_dataset_list_bulk(const char *fsname, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	objset_t *os;
+	dsl_dir_t *dd;
+	zap_cursor_t zc;
+	zap_attribute_t *attr;
+	nvlist_t *datasets;
+	uint64_t cursor, max_count, count = 0;
+	uint64_t next_cursor;
+	boolean_t simple;
+	int error;
+
+	/* Parse input parameters */
+	cursor = fnvlist_lookup_uint64(innvl, "cursor");
+	if (nvlist_lookup_uint64(innvl, "max_count", &max_count) != 0)
+		max_count = 1000;
+	if (nvlist_lookup_boolean_value(innvl, "simple", &simple) != 0)
+		simple = B_FALSE;
+
+	/* Clamp max_count to prevent excessive memory usage */
+	if (max_count > 10000)
+		max_count = 10000;
+
+	error = dmu_objset_hold(fsname, FTAG, &os);
+	if (error != 0)
+		return (error);
+
+	/* Cannot iterate children of a snapshot */
+	if (os->os_dsl_dataset->ds_object !=
+	    dsl_dir_phys(os->os_dsl_dataset->ds_dir)->dd_head_dataset_obj) {
+		dmu_objset_rele(os, FTAG);
+		return (SET_ERROR(EINVAL));
+	}
+
+	dd = os->os_dsl_dataset->ds_dir;
+	datasets = fnvlist_alloc();
+	attr = zap_attribute_alloc();
+
+	zap_cursor_init_serialized(&zc, dd->dd_pool->dp_meta_objset,
+	    dsl_dir_phys(dd)->dd_child_dir_zapobj, cursor);
+
+	while (count < max_count) {
+		char fullname[ZFS_MAX_DATASET_NAME_LEN];
+		nvlist_t *ds_props;
+		objset_t *child_os;
+
+		if (zap_cursor_retrieve(&zc, attr) != 0)
+			break;	/* No more entries */
+
+		/* Build full dataset name */
+		(void) snprintf(fullname, sizeof (fullname), "%s/%s",
+		    fsname, attr->za_name);
+
+		/* Skip hidden datasets */
+		if (zfs_dataset_name_hidden(fullname)) {
+			zap_cursor_advance(&zc);
+			continue;
+		}
+
+		/* Get stats for this dataset */
+		error = dmu_objset_hold(fullname, FTAG, &child_os);
+		if (error != 0) {
+			/* Dataset may have been destroyed, skip it */
+			zap_cursor_advance(&zc);
+			continue;
+		}
+
+		ds_props = fnvlist_alloc();
+		if (simple) {
+			dmu_objset_stats_t stats;
+			dmu_objset_fast_stat(child_os, &stats);
+			fnvlist_add_uint8_array(ds_props, "stats",
+			    (uint8_t *)&stats, sizeof (stats));
+		} else {
+			dmu_objset_stats_t stats;
+			dmu_objset_fast_stat(child_os, &stats);
+			fnvlist_add_uint8_array(ds_props, "stats",
+			    (uint8_t *)&stats, sizeof (stats));
+			/* Full stats could be added here if needed */
+		}
+
+		dmu_objset_rele(child_os, FTAG);
+		fnvlist_add_nvlist(datasets, attr->za_name, ds_props);
+		fnvlist_free(ds_props);
+		count++;
+
+		zap_cursor_advance(&zc);
+	}
+
+	/* Store next cursor */
+	if (zap_cursor_retrieve(&zc, attr) == 0) {
+		next_cursor = zap_cursor_serialize(&zc);
+	} else {
+		next_cursor = UINT64_MAX;
+	}
+
+	fnvlist_add_uint64(outnvl, "next_cursor", next_cursor);
+	fnvlist_add_nvlist(outnvl, "datasets", datasets);
+
+	fnvlist_free(datasets);
+	zap_attribute_free(attr);
+	zap_cursor_fini(&zc);
+	dmu_objset_rele(os, FTAG);
+
+	return (0);
+}
+
+/*
+ * Bulk snapshot listing - returns multiple snapshots in a single call.
+ *
+ * innvl: {
+ *     "cursor" -> uint64_t (zap cursor, 0 to start)
+ *     "max_count" -> uint64_t (max snapshots to return, default 1000)
+ *     "simple" -> boolean (skip properties if true)
+ *     "min_txg" -> uint64_t (optional, filter by min creation txg)
+ *     "max_txg" -> uint64_t (optional, filter by max creation txg)
+ * }
+ *
+ * outnvl: {
+ *     "next_cursor" -> uint64_t (cursor for next call, UINT64_MAX if done)
+ *     "snapshots" -> {
+ *         "snap_name1" -> { "stats" -> dmu_objset_stats_t as uint8 array },
+ *         "snap_name2" -> { ... },
+ *         ...
+ *     }
+ * }
+ */
+static const zfs_ioc_key_t zfs_keys_snapshot_list_bulk[] = {
+	{"cursor",	DATA_TYPE_UINT64,	0},
+	{"max_count",	DATA_TYPE_UINT64,	ZK_OPTIONAL},
+	{"simple",	DATA_TYPE_BOOLEAN_VALUE, ZK_OPTIONAL},
+	{"min_txg",	DATA_TYPE_UINT64,	ZK_OPTIONAL},
+	{"max_txg",	DATA_TYPE_UINT64,	ZK_OPTIONAL},
+};
+
+static int
+zfs_ioc_snapshot_list_bulk(const char *fsname, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	objset_t *os;
+	dsl_dataset_t *ds;
+	zap_cursor_t zc;
+	zap_attribute_t *attr;
+	nvlist_t *snapshots;
+	uint64_t cursor, max_count, count = 0;
+	uint64_t next_cursor;
+	uint64_t min_txg, max_txg;
+	boolean_t simple;
+	int error;
+
+	/* Parse input parameters */
+	cursor = fnvlist_lookup_uint64(innvl, "cursor");
+	if (nvlist_lookup_uint64(innvl, "max_count", &max_count) != 0)
+		max_count = 1000;
+	if (nvlist_lookup_boolean_value(innvl, "simple", &simple) != 0)
+		simple = B_FALSE;
+	if (nvlist_lookup_uint64(innvl, "min_txg", &min_txg) != 0)
+		min_txg = 0;
+	if (nvlist_lookup_uint64(innvl, "max_txg", &max_txg) != 0)
+		max_txg = UINT64_MAX;
+
+	/* Clamp max_count to prevent excessive memory usage */
+	if (max_count > 10000)
+		max_count = 10000;
+
+	error = dmu_objset_hold(fsname, FTAG, &os);
+	if (error != 0)
+		return (error);
+
+	ds = os->os_dsl_dataset;
+	snapshots = fnvlist_alloc();
+	attr = zap_attribute_alloc();
+
+	zap_cursor_init_serialized(&zc,
+	    dsl_dataset_get_spa(ds)->spa_meta_objset,
+	    dsl_dataset_phys(ds)->ds_snapnames_zapobj, cursor);
+
+	while (count < max_count) {
+		dsl_dataset_t *snap_ds;
+		nvlist_t *snap_props;
+		uint64_t snap_obj;
+
+		if (zap_cursor_retrieve(&zc, attr) != 0)
+			break;	/* No more entries */
+
+		snap_obj = attr->za_first_integer;
+
+		/* Get the snapshot dataset */
+		error = dsl_dataset_hold_obj(ds->ds_dir->dd_pool,
+		    snap_obj, FTAG, &snap_ds);
+		if (error != 0) {
+			/* Snapshot may have been destroyed, skip it */
+			zap_cursor_advance(&zc);
+			continue;
+		}
+
+		/* Filter by txg range */
+		if ((min_txg != 0 && dsl_get_creationtxg(snap_ds) < min_txg) ||
+		    (max_txg != UINT64_MAX &&
+		    dsl_get_creationtxg(snap_ds) > max_txg)) {
+			dsl_dataset_rele(snap_ds, FTAG);
+			zap_cursor_advance(&zc);
+			continue;
+		}
+
+		snap_props = fnvlist_alloc();
+		if (simple) {
+			dmu_objset_stats_t stats;
+			dsl_dataset_fast_stat(snap_ds, &stats);
+			fnvlist_add_uint8_array(snap_props, "stats",
+			    (uint8_t *)&stats, sizeof (stats));
+		} else {
+			dmu_objset_stats_t stats;
+			dsl_dataset_fast_stat(snap_ds, &stats);
+			fnvlist_add_uint8_array(snap_props, "stats",
+			    (uint8_t *)&stats, sizeof (stats));
+		}
+
+		dsl_dataset_rele(snap_ds, FTAG);
+		fnvlist_add_nvlist(snapshots, attr->za_name, snap_props);
+		fnvlist_free(snap_props);
+		count++;
+
+		zap_cursor_advance(&zc);
+	}
+
+	/* Store next cursor */
+	if (zap_cursor_retrieve(&zc, attr) == 0) {
+		next_cursor = zap_cursor_serialize(&zc);
+	} else {
+		next_cursor = UINT64_MAX;
+	}
+
+	fnvlist_add_uint64(outnvl, "next_cursor", next_cursor);
+	fnvlist_add_nvlist(outnvl, "snapshots", snapshots);
+
+	fnvlist_free(snapshots);
+	zap_attribute_free(attr);
+	zap_cursor_fini(&zc);
+	dmu_objset_rele(os, FTAG);
+
+	return (0);
+}
+
 static int
 zfs_prop_set_userquota(const char *dsname, nvpair_t *pair)
 {
@@ -7541,6 +7809,16 @@ zfs_ioctl_init(void)
 	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_TRUE, B_TRUE,
 	    zfs_keys_destroy_bookmarks,
 	    ARRAY_SIZE(zfs_keys_destroy_bookmarks));
+
+	zfs_ioctl_register("dataset_list_bulk", ZFS_IOC_DATASET_LIST_BULK,
+	    zfs_ioc_dataset_list_bulk, zfs_secpolicy_read, DATASET_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_dataset_list_bulk, ARRAY_SIZE(zfs_keys_dataset_list_bulk));
+
+	zfs_ioctl_register("snapshot_list_bulk", ZFS_IOC_SNAPSHOT_LIST_BULK,
+	    zfs_ioc_snapshot_list_bulk, zfs_secpolicy_read, DATASET_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_snapshot_list_bulk, ARRAY_SIZE(zfs_keys_snapshot_list_bulk));
 
 	zfs_ioctl_register("receive", ZFS_IOC_RECV_NEW,
 	    zfs_ioc_recv_new, zfs_secpolicy_recv, DATASET_NAME,
