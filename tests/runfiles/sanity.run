@@ -94,7 +94,7 @@ post =
 tags = ['functional', 'cli_root', 'zdb']
 
 [tests/functional/cli_root/zfs]
-tests = ['zfs_001_neg', 'zfs_002_pos']
+tests = ['zfs_001_neg', 'zfs_002_pos', 'zfs_004_pos']
 tags = ['functional', 'cli_root', 'zfs']
 
 [tests/functional/cli_root/zfs_bookmark]
