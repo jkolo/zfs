@@ -34,6 +34,7 @@
 #include <stddef.h>
 #include <libintl.h>
 #include <libzfs.h>
+#include <libzfs_core.h>
 #include <libzutil.h>
 #include <sys/mntent.h>
 
@@ -101,24 +102,16 @@ top:
 }
 
 /*
- * Iterate over all child filesystems
+ * Legacy filesystem iteration using per-dataset ioctl calls.
+ * Used as fallback when bulk iteration is not supported.
  */
-int
-zfs_iter_filesystems(zfs_handle_t *zhp, zfs_iter_f func, void *data)
-{
-	return (zfs_iter_filesystems_v2(zhp, 0, func, data));
-}
-
-int
-zfs_iter_filesystems_v2(zfs_handle_t *zhp, int flags, zfs_iter_f func,
+static int
+zfs_iter_filesystems_legacy(zfs_handle_t *zhp, int flags, zfs_iter_f func,
     void *data)
 {
 	zfs_cmd_t zc = {"\0"};
 	zfs_handle_t *nzhp;
 	int ret;
-
-	if (zhp->zfs_type != ZFS_TYPE_FILESYSTEM)
-		return (0);
 
 	zcmd_alloc_dst_nvlist(zhp->zfs_hdl, &zc, 0);
 
@@ -131,10 +124,6 @@ zfs_iter_filesystems_v2(zfs_handle_t *zhp, int flags, zfs_iter_f func,
 			nzhp = make_dataset_simple_handle_zc(zhp, &zc);
 		else
 			nzhp = make_dataset_handle_zc(zhp->zfs_hdl, &zc);
-		/*
-		 * Silently ignore errors, as the only plausible explanation is
-		 * that the pool has since been removed.
-		 */
 		if (nzhp == NULL)
 			continue;
 
@@ -148,6 +137,137 @@ zfs_iter_filesystems_v2(zfs_handle_t *zhp, int flags, zfs_iter_f func,
 }
 
 /*
+ * Bulk filesystem iteration - tries to use bulk ioctl for better performance.
+ * Falls back to legacy iteration if kernel doesn't support bulk ioctl.
+ */
+static int
+zfs_iter_filesystems_bulk(zfs_handle_t *zhp, int flags, zfs_iter_f func,
+    void *data)
+{
+	libzfs_handle_t *hdl = zhp->zfs_hdl;
+	nvlist_t *result = NULL;
+	nvlist_t *datasets;
+	nvpair_t *pair;
+	uint64_t cursor = 0, next_cursor;
+	boolean_t simple = (flags & ZFS_ITER_SIMPLE) != 0;
+	int error, ret = 0;
+
+	while (cursor != UINT64_MAX) {
+		error = lzc_list_datasets_bulk(zhp->zfs_name, cursor,
+		    1000, simple, &result, &next_cursor);
+
+		if (error == ZFS_ERR_IOC_CMD_UNAVAIL) {
+			/* Kernel doesn't support bulk ioctl, fall back */
+			return (zfs_iter_filesystems_legacy(zhp, flags,
+			    func, data));
+		}
+
+		if (error != 0) {
+			return (zfs_standard_error(hdl, error,
+			    dgettext(TEXT_DOMAIN,
+			    "cannot iterate filesystems")));
+		}
+
+		/* Get the datasets nvlist from result */
+		if (nvlist_lookup_nvlist(result, "datasets", &datasets) != 0) {
+			fnvlist_free(result);
+			break;
+		}
+
+		/* Process returned datasets */
+		for (pair = nvlist_next_nvpair(datasets, NULL);
+		    pair != NULL;
+		    pair = nvlist_next_nvpair(datasets, pair)) {
+			char fullname[ZFS_MAX_DATASET_NAME_LEN];
+			nvlist_t *props;
+			zfs_handle_t *nzhp;
+			uint8_t *stats_data;
+			uint_t stats_len;
+
+			(void) snprintf(fullname, sizeof (fullname), "%s/%s",
+			    zhp->zfs_name, nvpair_name(pair));
+
+			if (nvpair_value_nvlist(pair, &props) != 0)
+				continue;
+
+			/* Create handle from bulk data */
+			nzhp = calloc(1, sizeof (zfs_handle_t));
+			if (nzhp == NULL)
+				continue;
+
+			nzhp->zfs_hdl = hdl;
+
+			(void) strlcpy(nzhp->zfs_name, fullname,
+			    sizeof (nzhp->zfs_name));
+
+			/* Extract stats */
+			if (nvlist_lookup_uint8_array(props, "stats",
+			    &stats_data, &stats_len) == 0 &&
+			    stats_len == sizeof (dmu_objset_stats_t)) {
+				(void) memcpy(&nzhp->zfs_dmustats, stats_data,
+				    sizeof (dmu_objset_stats_t));
+			}
+
+			/* Extract properties if available */
+			nvlist_t *ds_proplist;
+			if (nvlist_lookup_nvlist(props, "props",
+			    &ds_proplist) == 0) {
+				nvlist_t *userprops;
+				userprops = process_user_props(nzhp, ds_proplist);
+				if (userprops != NULL) {
+					nzhp->zfs_props = fnvlist_dup(ds_proplist);
+					nzhp->zfs_user_props = userprops;
+				}
+			}
+
+			/* Determine type from stats */
+			if (nzhp->zfs_dmustats.dds_type == DMU_OST_ZVOL) {
+				nzhp->zfs_head_type = ZFS_TYPE_VOLUME;
+				nzhp->zfs_type = ZFS_TYPE_VOLUME;
+			} else {
+				nzhp->zfs_head_type = ZFS_TYPE_FILESYSTEM;
+				nzhp->zfs_type = nzhp->zfs_dmustats.dds_is_snapshot ?
+				    ZFS_TYPE_SNAPSHOT : ZFS_TYPE_FILESYSTEM;
+			}
+
+			/* Use parent's pool handle */
+			nzhp->zpool_hdl = zhp->zpool_hdl;
+
+			if ((ret = func(nzhp, data)) != 0) {
+				fnvlist_free(result);
+				return (ret);
+			}
+		}
+
+		fnvlist_free(result);
+		result = NULL;
+		cursor = next_cursor;
+	}
+
+	return (0);
+}
+
+/*
+ * Iterate over all child filesystems
+ */
+int
+zfs_iter_filesystems(zfs_handle_t *zhp, zfs_iter_f func, void *data)
+{
+	return (zfs_iter_filesystems_v2(zhp, 0, func, data));
+}
+
+int
+zfs_iter_filesystems_v2(zfs_handle_t *zhp, int flags, zfs_iter_f func,
+    void *data)
+{
+	if (zhp->zfs_type != ZFS_TYPE_FILESYSTEM)
+		return (0);
+
+	/* Try bulk iteration first, with automatic fallback to legacy */
+	return (zfs_iter_filesystems_bulk(zhp, flags, func, data));
+}
+
+/*
  * Iterate over all snapshots
  */
 int
@@ -158,18 +278,18 @@ zfs_iter_snapshots(zfs_handle_t *zhp, boolean_t simple, zfs_iter_f func,
 	    data, min_txg, max_txg));
 }
 
-int
-zfs_iter_snapshots_v2(zfs_handle_t *zhp, int flags, zfs_iter_f func,
+/*
+ * Legacy snapshot iteration using per-snapshot ioctl calls.
+ * Used as fallback when bulk iteration is not supported.
+ */
+static int
+zfs_iter_snapshots_legacy(zfs_handle_t *zhp, int flags, zfs_iter_f func,
     void *data, uint64_t min_txg, uint64_t max_txg)
 {
 	zfs_cmd_t zc = {"\0"};
 	zfs_handle_t *nzhp;
 	int ret;
 	nvlist_t *range_nvl = NULL;
-
-	if (zhp->zfs_type == ZFS_TYPE_SNAPSHOT ||
-	    zhp->zfs_type == ZFS_TYPE_BOOKMARK)
-		return (0);
 
 	zc.zc_simple = (flags & ZFS_ITER_SIMPLE) != 0;
 
@@ -207,6 +327,126 @@ zfs_iter_snapshots_v2(zfs_handle_t *zhp, int flags, zfs_iter_f func,
 	zcmd_free_nvlists(&zc);
 	fnvlist_free(range_nvl);
 	return ((ret < 0) ? ret : 0);
+}
+
+/*
+ * Bulk snapshot iteration - returns multiple snapshots per ioctl call.
+ */
+static int
+zfs_iter_snapshots_bulk(zfs_handle_t *zhp, int flags, zfs_iter_f func,
+    void *data, uint64_t min_txg, uint64_t max_txg)
+{
+	libzfs_handle_t *hdl = zhp->zfs_hdl;
+	nvlist_t *result = NULL;
+	nvlist_t *snapshots;
+	nvpair_t *pair;
+	uint64_t cursor = 0, next_cursor;
+	boolean_t simple = (flags & ZFS_ITER_SIMPLE) != 0;
+	int error, ret = 0;
+
+	while (cursor != UINT64_MAX) {
+		error = lzc_list_snapshots_bulk(zhp->zfs_name, cursor,
+		    1000, simple, min_txg, max_txg, &result, &next_cursor);
+
+		if (error == ZFS_ERR_IOC_CMD_UNAVAIL) {
+			/* Kernel doesn't support bulk ioctl, fall back */
+			return (zfs_iter_snapshots_legacy(zhp, flags, func,
+			    data, min_txg, max_txg));
+		}
+
+		if (error != 0) {
+			return (zfs_standard_error(hdl, error,
+			    dgettext(TEXT_DOMAIN,
+			    "cannot iterate snapshots")));
+		}
+
+		/* Get the snapshots nvlist from result */
+		if (nvlist_lookup_nvlist(result, "snapshots",
+		    &snapshots) != 0) {
+			fnvlist_free(result);
+			break;
+		}
+
+		/* Process returned snapshots */
+		for (pair = nvlist_next_nvpair(snapshots, NULL);
+		    pair != NULL;
+		    pair = nvlist_next_nvpair(snapshots, pair)) {
+			char fullname[ZFS_MAX_DATASET_NAME_LEN];
+			nvlist_t *props;
+			zfs_handle_t *nzhp;
+			uint8_t *stats_data;
+			uint_t stats_len;
+
+			(void) snprintf(fullname, sizeof (fullname), "%s@%s",
+			    zhp->zfs_name, nvpair_name(pair));
+
+			if (nvpair_value_nvlist(pair, &props) != 0)
+				continue;
+
+			/* Create handle from bulk data */
+			nzhp = calloc(1, sizeof (zfs_handle_t));
+			if (nzhp == NULL)
+				continue;
+
+			nzhp->zfs_hdl = hdl;
+
+			(void) strlcpy(nzhp->zfs_name, fullname,
+			    sizeof (nzhp->zfs_name));
+
+			/* Extract stats */
+			if (nvlist_lookup_uint8_array(props, "stats",
+			    &stats_data, &stats_len) == 0 &&
+			    stats_len == sizeof (dmu_objset_stats_t)) {
+				(void) memcpy(&nzhp->zfs_dmustats, stats_data,
+				    sizeof (dmu_objset_stats_t));
+			}
+
+			/* Extract properties if available */
+			nvlist_t *ds_proplist;
+			if (nvlist_lookup_nvlist(props, "props",
+			    &ds_proplist) == 0) {
+				nvlist_t *userprops;
+				userprops = process_user_props(nzhp,
+				    ds_proplist);
+				if (userprops != NULL) {
+					nzhp->zfs_props =
+					    fnvlist_dup(ds_proplist);
+					nzhp->zfs_user_props = userprops;
+				}
+			}
+
+			/* Set type for snapshot */
+			nzhp->zfs_head_type = zhp->zfs_head_type;
+			nzhp->zfs_type = ZFS_TYPE_SNAPSHOT;
+
+			/* Use parent's pool handle */
+			nzhp->zpool_hdl = zhp->zpool_hdl;
+
+			if ((ret = func(nzhp, data)) != 0) {
+				fnvlist_free(result);
+				return (ret);
+			}
+		}
+
+		fnvlist_free(result);
+		result = NULL;
+		cursor = next_cursor;
+	}
+
+	return (0);
+}
+
+int
+zfs_iter_snapshots_v2(zfs_handle_t *zhp, int flags, zfs_iter_f func,
+    void *data, uint64_t min_txg, uint64_t max_txg)
+{
+	if (zhp->zfs_type == ZFS_TYPE_SNAPSHOT ||
+	    zhp->zfs_type == ZFS_TYPE_BOOKMARK)
+		return (0);
+
+	/* Try bulk iteration first, with automatic fallback to legacy */
+	return (zfs_iter_snapshots_bulk(zhp, flags, func, data,
+	    min_txg, max_txg));
 }
 
 /*

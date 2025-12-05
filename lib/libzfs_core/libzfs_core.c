@@ -1546,6 +1546,115 @@ lzc_destroy_bookmarks(nvlist_t *bmarks, nvlist_t **errlist)
 	return (error);
 }
 
+/*
+ * Get datasets in bulk.
+ *
+ * Lists child datasets of fsname, returning multiple datasets per call.
+ *
+ * fsname:      Parent dataset name
+ * cursor:      Iteration cursor (0 to start)
+ * max_count:   Maximum number of datasets to return per call
+ * simple:      If true, only return stats (no properties)
+ * datasets:    Output nvlist with dataset information (caller must free)
+ * next_cursor: Output cursor for next iteration (UINT64_MAX when complete)
+ *
+ * The format of the returned nvlist is:
+ * {
+ *     "next_cursor" -> uint64 (cursor for next call, UINT64_MAX if done)
+ *     "datasets" -> {
+ *         "child_name1" -> { "stats" -> uint8 array (dmu_objset_stats_t) },
+ *         "child_name2" -> { ... },
+ *         ...
+ *     }
+ * }
+ *
+ * Returns 0 on success, or an error code on failure.
+ * Returns ENOTTY if the kernel doesn't support bulk iteration.
+ */
+int
+lzc_list_datasets_bulk(const char *fsname, uint64_t cursor, uint64_t max_count,
+    boolean_t simple, nvlist_t **outnvl, uint64_t *next_cursor)
+{
+	nvlist_t *args;
+	nvlist_t *result = NULL;
+	int error;
+
+	args = fnvlist_alloc();
+	fnvlist_add_uint64(args, "cursor", cursor);
+	fnvlist_add_uint64(args, "max_count", max_count);
+	fnvlist_add_boolean_value(args, "simple", simple);
+
+	error = lzc_ioctl(ZFS_IOC_DATASET_LIST_BULK, fsname, args, &result);
+	fnvlist_free(args);
+
+	if (error == 0 && result != NULL) {
+		*next_cursor = fnvlist_lookup_uint64(result, "next_cursor");
+		*outnvl = result;
+	} else if (result != NULL) {
+		fnvlist_free(result);
+	}
+
+	return (error);
+}
+
+/*
+ * Get snapshots in bulk.
+ *
+ * Lists snapshots of fsname, returning multiple snapshots per call.
+ *
+ * fsname:      Dataset name (filesystem or volume)
+ * cursor:      Iteration cursor (0 to start)
+ * max_count:   Maximum number of snapshots to return per call
+ * simple:      If true, only return stats (no properties)
+ * min_txg:     Minimum creation txg filter (0 for no filter)
+ * max_txg:     Maximum creation txg filter (UINT64_MAX for no filter)
+ * outnvl:      Output nvlist with snapshot information (caller must free)
+ * next_cursor: Output cursor for next iteration (UINT64_MAX when complete)
+ *
+ * The format of the returned nvlist is:
+ * {
+ *     "next_cursor" -> uint64 (cursor for next call, UINT64_MAX if done)
+ *     "snapshots" -> {
+ *         "snap_name1" -> { "stats" -> uint8 array (dmu_objset_stats_t) },
+ *         "snap_name2" -> { ... },
+ *         ...
+ *     }
+ * }
+ *
+ * Returns 0 on success, or an error code on failure.
+ * Returns ENOTTY if the kernel doesn't support bulk iteration.
+ */
+int
+lzc_list_snapshots_bulk(const char *fsname, uint64_t cursor, uint64_t max_count,
+    boolean_t simple, uint64_t min_txg, uint64_t max_txg,
+    nvlist_t **outnvl, uint64_t *next_cursor)
+{
+	nvlist_t *args;
+	nvlist_t *result = NULL;
+	int error;
+
+	args = fnvlist_alloc();
+	fnvlist_add_uint64(args, "cursor", cursor);
+	fnvlist_add_uint64(args, "max_count", max_count);
+	fnvlist_add_boolean_value(args, "simple", simple);
+	if (min_txg != 0)
+		fnvlist_add_uint64(args, "min_txg", min_txg);
+	if (max_txg != UINT64_MAX)
+		fnvlist_add_uint64(args, "max_txg", max_txg);
+
+	error = lzc_ioctl(ZFS_IOC_SNAPSHOT_LIST_BULK, fsname, args, &result);
+	fnvlist_free(args);
+
+	if (error == 0 && result != NULL) {
+		*next_cursor = fnvlist_lookup_uint64(result, "next_cursor");
+		*outnvl = result;
+	} else if (result != NULL) {
+		fnvlist_free(result);
+	}
+
+	return (error);
+}
+
 static int
 lzc_channel_program_impl(const char *pool, const char *program, boolean_t sync,
     uint64_t instrlimit, uint64_t memlimit, nvlist_t *argnvl, nvlist_t **outnvl)

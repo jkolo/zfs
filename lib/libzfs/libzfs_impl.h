@@ -142,6 +142,7 @@ extern int zpool_standard_error_fmt(libzfs_handle_t *, int, const char *, ...)
 
 extern zfs_handle_t *make_dataset_handle_zc(libzfs_handle_t *, zfs_cmd_t *);
 extern zfs_handle_t *make_dataset_simple_handle_zc(zfs_handle_t *, zfs_cmd_t *);
+extern nvlist_t *process_user_props(zfs_handle_t *, nvlist_t *);
 
 extern int zprop_parse_value(libzfs_handle_t *, nvpair_t *, int, zfs_type_t,
     nvlist_t *, const char **, uint64_t *, const char *);

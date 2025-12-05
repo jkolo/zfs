@@ -233,7 +233,7 @@ zfs_name_valid(const char *name, zfs_type_t type)
  * This function takes the raw DSL properties, and filters out the user-defined
  * properties into a separate nvlist.
  */
-static nvlist_t *
+nvlist_t *
 process_user_props(zfs_handle_t *zhp, nvlist_t *props)
 {
 	libzfs_handle_t *hdl = zhp->zfs_hdl;
