@@ -1000,6 +1000,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/cli_root/zfs/zfs_001_neg.ksh \
 	functional/cli_root/zfs/zfs_002_pos.ksh \
 	functional/cli_root/zfs/zfs_003_neg.ksh \
+	functional/cli_root/zfs/zfs_004_pos.ksh \
 	functional/cli_root/zhack/zhack_label_repair_001.ksh \
 	functional/cli_root/zhack/zhack_label_repair_002.ksh \
 	functional/cli_root/zhack/zhack_label_repair_003.ksh \
