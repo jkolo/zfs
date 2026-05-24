@@ -705,6 +705,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/cli_root/zfs_create/zfs_create_crypt_combos.ksh \
 	functional/cli_root/zfs_create/zfs_create_dryrun.ksh \
 	functional/cli_root/zfs_create/zfs_create_encrypted.ksh \
+	functional/cli_root/zfs_create/zfs_create_encrypted_after_recv.ksh \
 	functional/cli_root/zfs_create/zfs_create_nomount.ksh \
 	functional/cli_root/zfs_create/zfs_create_verbose.ksh \
 	functional/cli_root/zfs_destroy/cleanup.ksh \
