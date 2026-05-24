@@ -2382,6 +2382,39 @@ dsl_scan_visitbp(const blkptr_t *bp, const zbookmark_phys_t *zb,
 	}
 
 	/*
+	 * Detect "unencrypted block in encrypted object set" corruption.
+	 * On an encrypted dataset every leaf BP must have BP_USES_CRYPT
+	 * set; the read path in dbuf.c converts a missing flag to EIO,
+	 * and the create path historically panicked in zfs_mknode.
+	 *
+	 * Log each occurrence so it appears in 'zpool status -v', and
+	 * count it for the scan's permanent-error tally.
+	 *
+	 * Only leaf BPs are checked here — indirect blocks (level > 0)
+	 * carry MAC-of-MAC semantics and embedded blocks store data in
+	 * the BP itself.
+	 *
+	 * Refs: #14330 #15275 #16065 #14709
+	 */
+	if (ds != NULL && BP_GET_LEVEL(bp) == 0 && !BP_IS_EMBEDDED(bp) &&
+	    !BP_USES_CRYPT(bp)) {
+		objset_t *bp_os;
+		if (dmu_objset_from_ds(ds, &bp_os) == 0 &&
+		    bp_os->os_encrypted) {
+			scn->scn_phys.scn_errors++;
+			spa_log_error(dp->dp_spa, zb,
+			    BP_GET_PHYSICAL_BIRTH(bp));
+			zfs_dbgmsg("scrub: encrypted objset %llu has BP "
+			    "without BP_USES_CRYPT (object %llu, "
+			    "level %u, blkid %llu)",
+			    (u_longlong_t)zb->zb_objset,
+			    (u_longlong_t)zb->zb_object,
+			    (uint_t)zb->zb_level,
+			    (u_longlong_t)zb->zb_blkid);
+		}
+	}
+
+	/*
 	 * Check if this block contradicts any filesystem flags.
 	 */
 	spa_feature_t f = SPA_FEATURE_LARGE_BLOCKS;
