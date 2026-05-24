@@ -42,6 +42,10 @@
 .Op Fl w
 .Op Fl S Ar date
 .Op Fl E Ar date
+.Op Fl -repair-crypt-mismatches
+.Op Fl -smart-fix-crypt
+.Op Fl -reencrypt-crypt-mismatches
+.Op Fl -free-crypt-mismatches-fallback
 .Fl a Ns | Ns Ar pool Ns …
 .
 .Sh DESCRIPTION
@@ -72,6 +76,23 @@ However, if the keys are not loaded and an unrepairable checksum error is
 detected the file name cannot be included in the
 .Nm zpool Cm status Fl v
 verbose error report.
+.Pp
+On natively-encrypted datasets, scrub additionally checks that every
+leaf block pointer has the
+.Sy BP_USES_CRYPT
+flag set.
+Block pointers missing this flag indicate the
+.Qq unencrypted block in encrypted object set
+corruption class
+.Pq see Sx ENCRYPTION FLAG MISMATCHES below
+and are reported in
+.Nm zpool Cm status Fl v
+as permanent errors against the affected files, alongside a per-pool
+.Sy encryption flag mismatches : Ar N
+counter.
+The check is gated on
+.Sy os_encrypted
+so unencrypted pools incur no overhead.
 .Pp
 Because scrubbing and resilvering are I/O-intensive operations, ZFS only allows
 one at a time.
@@ -165,7 +186,115 @@ The time should be provided in machine local time zone.
 Specifying dates prior to enabling this feature will result in scrubbing
 starting from the date the pool was created.
 If the time was moved backward manually the data range may become inaccurate.
+.It Fl -repair-crypt-mismatches
+Enable the automatic repair pipeline for encryption flag mismatches on
+natively-encrypted datasets
+.Pq see Sx ENCRYPTION FLAG MISMATCHES .
+Without this flag, scrub only detects and reports mismatches; it does
+not modify any block.
+With this flag, scrub attempts the least destructive repair per block:
+first the lossless smart flip
+.Pq Mode 1.5 ,
+then re-encrypt rewrite if the AEAD tag fails to verify
+.Pq Mode 2 ,
+then leave the block untouched and reported for manual action.
+.Pp
+Smart flip tries to decrypt the block with the dataset key.
+If the AEAD tag verifies, the block is genuinely encrypted and only
+.Sy BP_USES_CRYPT
+was lost; the flag is set atomically in the next txg with no rewrite.
+.Pp
+Re-encrypt rewrite reads the on-disk block as plaintext, encrypts it
+with the dataset key, allocates a new DVA, rewrites via
+.Fn zio_rewrite ,
+and atomically replaces the BP in the parent dnode.
+Data is preserved if the plaintext was sensible; if the bug had left
+uninitialized memory on disk, the rewritten block contains the same
+garbage but is structurally valid.
+.Pp
+The log-only fallback applies if the dataset key is unavailable, the
+pool is out of space, or both modes fail for some other reason.
+The block is reported in
+.Nm zpool Cm status Fl v
+and left for manual action or for
+.Fl -free-crypt-mismatches-fallback .
+.It Fl -smart-fix-crypt
+Run only Mode 1.5
+.Pq smart flip
+without falling through to re-encrypt.
+Use this when you suspect the corruption is the write-path race
+.Pq flag-only loss
+and want to avoid any rewrite I/O.
+.It Fl -reencrypt-crypt-mismatches
+Run only Mode 2
+.Pq re-encrypt rewrite
+without first trying Mode 1.5.
+Use this when you already know the affected blocks are plaintext and
+want to skip the decrypt-and-verify probe.
+.It Fl -free-crypt-mismatches-fallback
+After both Mode 1.5 and Mode 2 have failed for a block, free the BP
+.Pq Mode 3 .
+The file gets a hole at the affected offset; the rest of the file
+remains readable.
+This is a destructive last resort and must be combined with
+.Fl -repair-crypt-mismatches
+or
+.Fl -reencrypt-crypt-mismatches .
 .El
+.Sh ENCRYPTION FLAG MISMATCHES
+Native encryption requires every leaf block pointer in an encrypted
+dataset to carry the
+.Sy BP_USES_CRYPT
+flag, together with the IV, MAC, and salt that describe the AEAD
+construction.
+Several historical write and recv paths could leave the flag clear on
+otherwise valid block pointers, resulting in the long-standing
+.Qq unencrypted block in encrypted object set
+corruption class
+.Pq Lk https://github.com/openzfs/zfs/issues/14330 ,
+.Lk https://github.com/openzfs/zfs/issues/15275 ,
+.Lk https://github.com/openzfs/zfs/issues/16065 ,
+.Lk https://github.com/openzfs/zfs/issues/14709 .
+Such blocks are unreadable
+.Pq EIO
+and have, historically, triggered kernel panics in the create path.
+.Pp
+This corruption may arise from:
+.Bl -bullet -compact -offset indent
+.It
+.Nm zfs Cm recv
+into an encrypted dataset under specific stream layouts
+.It
+write-path races that complete the BP before
+.Fn BP_SET_CRYPT
+.It
+hardware-induced corruption of the relevant
+.Sy blk_prop
+bit
+.El
+.Pp
+Scrub detects these blocks unconditionally and reports them in
+.Nm zpool Cm status Fl v
+as permanent errors against the affected files, with a per-pool
+.Sy encryption flag mismatches : Ar N
+counter so administrators can distinguish this class from regular
+checksum failures.
+See message ID
+.Sy ZFS-8000-CR
+.Pq Lk https://openzfs.github.io/openzfs-docs/msg/ZFS-8000-CR
+for recommended remediation.
+.Pp
+Repair is opt-in via the
+.Fl -repair-crypt-mismatches
+family of options described under
+.Sx OPTIONS .
+For pools without redundancy
+.Pq single vdev, single-copy ,
+only the smart-flip path is fully lossless; re-encrypt rewrite preserves
+whatever the on-disk plaintext was, which may not be the original data
+if the bug overwrote it with garbage.
+For irreparable blocks the only remaining options are file deletion or
+restore from backup.
 .Sh EXAMPLES
 .Ss Example 1
 Status of pool with ongoing scrub:

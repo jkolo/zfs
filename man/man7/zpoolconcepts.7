@@ -512,3 +512,123 @@ property to nonzero.
 See
 .Xr zfsprops 7
 for more info on this property.
+.
+.Ss Encryption Flag Mismatches
+On a natively-encrypted dataset every leaf block pointer carries an
+.Sy BP_USES_CRYPT
+bit in
+.Sy blk_prop ,
+together with the IV
+.Pq stored in Sy blk_dva[2] ,
+the AEAD MAC
+.Pq stored in Sy blk_cksum ,
+and the salt
+.Pq stored in Sy blk_prop2 .
+The flag tells the read path to invoke the encryption pipeline; without
+it, the block is interpreted as ordinary plaintext.
+.Pp
+A persistent class of write- and recv-path bugs in OpenZFS could
+produce block pointers in encrypted datasets with
+.Sy BP_USES_CRYPT
+clear, even though the dataset itself remained encrypted.
+The on-disk block underneath such a BP may itself be either:
+.Bl -bullet -compact -offset indent
+.It
+genuinely encrypted ciphertext where only the flag was lost
+.Pq for example, a write-path race that completed the BP before Fn BP_SET_CRYPT ,
+or
+.It
+plaintext written without ever going through the encryption pipeline
+.Pq for example, certain send/recv stream layouts into an encrypted target .
+.El
+.Pp
+The consequences observed in practice are:
+.Bl -bullet -compact -offset indent
+.It
+.Sy EIO
+on any read of the affected block, surfacing in user space as
+.Qq Input/output error
+on the containing file.
+.It
+Recurring
+.Qq permanent errors
+in
+.Nm zpool Cm status Fl v
+that scrub appears to clear but which return on the next scrub.
+.It
+Historically, a kernel panic
+.Pq Qq unencrypted block in encrypted object set
+in the create path, which read-path mitigations have since converted
+to a graceful EIO.
+.El
+.Pp
+Scrub detects this class by checking
+.Sy BP_USES_CRYPT
+on every leaf BP whose containing object set is encrypted.
+The check is gated on
+.Sy os_encrypted ,
+so unencrypted pools incur no overhead.
+Mismatches are recorded in the SPA error log and surface in
+.Nm zpool Cm status Fl v
+as permanent errors against the affected files, with a per-pool
+.Sy encryption flag mismatches : Ar N
+counter that distinguishes them from ordinary checksum failures.
+.Pp
+Repair is opt-in.
+.Nm zpool Cm scrub Fl -repair-crypt-mismatches
+attempts, per block:
+.Bl -enum -compact -offset indent
+.It
+A
+.Em smart flip :
+the dataset key is used to decrypt the block; if the AEAD tag verifies,
+the block is genuinely encrypted, only the flag was lost, and the flag
+is set atomically in the next txg.
+This is a lossless repair.
+.It
+A
+.Em re-encrypt rewrite :
+the block is read as plaintext, encrypted with the dataset key,
+written to a new DVA, and the BP in the parent dnode is replaced
+atomically.
+Data is preserved to the extent the plaintext on disk was the intended
+content; if the original bug had stored uninitialized memory, that same
+content is now stored under a valid encrypted BP.
+.It
+A
+.Em log-only fallback
+that leaves the block untouched and reports it for manual action.
+Optionally,
+.Fl -free-crypt-mismatches-fallback
+will free the BP as a last resort, producing a hole in the file.
+.El
+.Pp
+Limitations:
+.Bl -bullet -compact -offset indent
+.It
+Detection covers only leaf
+.Pq Sy level == 0
+block pointers.
+Indirect blocks have MAC-of-MAC semantics and embedded blocks store
+data inside the BP itself; both are outside this corruption class.
+.It
+Without redundancy
+.Pq single-vdev, single-copy ,
+no automatic full repair is possible: smart flip remains lossless, but
+re-encrypt rewrite can only preserve whatever plaintext was on disk
+.Pq which may already be garbage if the original write bypassed encryption
+unintentionally .
+.It
+If the dataset key is not loaded, scrub still detects mismatches but
+cannot run smart flip or re-encrypt rewrite.
+Load the key
+.Pq Nm zfs Cm load-key
+and re-run scrub with the appropriate repair flag.
+.El
+.Pp
+See
+.Xr zpool-scrub 8
+for the user-facing options and message ID
+.Sy ZFS-8000-CR
+.Pq Lk https://openzfs.github.io/openzfs-docs/msg/ZFS-8000-CR
+for recommended remediation.

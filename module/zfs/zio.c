@@ -5011,9 +5011,8 @@ zio_vdev_io_bypass(zio_t *zio)
  */
 
 
-#ifdef ZFS_DEBUG
 /*
- * DEBUG-only knob used by the ZTS suite to reproduce the
+ * Test-only knob used by the ZTS suite to reproduce the
  * "unencrypted block in encrypted object set" failure class
  * (issues #14330, #15275, #16065, #14709).
  *
@@ -5024,10 +5023,10 @@ zio_vdev_io_bypass(zio_t *zio)
  * exercise Fix B's smart-flip repair path deterministically.
  *
  * MUST stay 0 outside of test workloads — running with this enabled
- * on a real pool will inject persistent corruption.
+ * on a real pool will inject persistent corruption. The knob is also
+ * intentionally undocumented in the man pages.
  */
 static uint_t zfs_debug_skip_bp_set_crypt = 0;
-#endif
 
 /*
  * This function is used for ZIO_STAGE_ENCRYPT. It is responsible for
@@ -5170,16 +5169,14 @@ zio_encrypt(zio_t *zio)
 		zio_crypt_encode_mac_zil(enc_buf, mac);
 		zio_push_transform(zio, eabd, psize, psize, NULL);
 	} else {
-#ifdef ZFS_DEBUG
 		/*
 		 * Test hook: when enabled, leave the BP without CRYPT to
 		 * exercise the encrypted-bp-uses-crypt failure path.
+		 * Must stay 0 in production — see zfs_debug_skip_bp_set_crypt
+		 * declaration above.
 		 */
 		if (!zfs_debug_skip_bp_set_crypt)
 			BP_SET_CRYPT(bp, B_TRUE);
-#else
-		BP_SET_CRYPT(bp, B_TRUE);
-#endif
 		zio_crypt_encode_params_bp(bp, salt, iv);
 		zio_crypt_encode_mac_bp(bp, mac);
 
@@ -6110,9 +6107,7 @@ ZFS_MODULE_PARAM(zfs_zio, zio_, dva_throttle_enabled, INT, ZMOD_RW,
 ZFS_MODULE_PARAM(zfs_zio, zio_, deadman_log_all, INT, ZMOD_RW,
 	"Log all slow ZIOs, not just those with vdevs");
 
-#ifdef ZFS_DEBUG
 ZFS_MODULE_PARAM(zfs, zfs_, debug_skip_bp_set_crypt, UINT, ZMOD_RW,
-	"DEBUG: skip BP_SET_CRYPT in encrypted data write path; "
+	"TEST-ONLY: skip BP_SET_CRYPT in encrypted data write path; "
 	"used by ZTS to reproduce 'unencrypted block in encrypted "
 	"object set' corruption. MUST be 0 in production.");
-#endif
