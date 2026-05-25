@@ -76,9 +76,38 @@ typedef struct dsl_scan_phys {
 typedef enum dsl_scan_flags {
 	DSF_VISIT_DS_AGAIN = 1<<0,
 	DSF_SCRUB_PAUSED = 1<<1,
+	/*
+	 * DSF_REPAIR_CRYPT_MISMATCHES: when scrub detects an
+	 * encrypted-objset block pointer without BP_USES_CRYPT,
+	 * attempt to repair it instead of only logging.
+	 * Repair tries (in order):
+	 *   1. Smart flip - decrypt + verify MAC; if MAC matches, the
+	 *      block is genuinely encrypted and the flag was lost in
+	 *      flight, so restore it via atomic dnode parent update
+	 *      (lossless).
+	 *   2. Re-encrypt rewrite - read raw plaintext, encrypt with
+	 *      the dataset key, write to a new disk location,
+	 *      atomically replace the parent BP (data preserved if
+	 *      plaintext was sensible).
+	 * Both repair modes work for leaf (level == 0) and indirect
+	 * (level > 0) blocks; indirect uses MAC-of-MAC verification
+	 * (see zio_crypt.c).
+	 * Refs: #14330 #15275 #16065 #14709 #18186.
+	 */
+	DSF_REPAIR_CRYPT_MISMATCHES = 1<<2,
+	/*
+	 * DSF_FREE_CRYPT_FALLBACK: when both smart-flip and re-encrypt
+	 * fail for a flagged BP, free the block as a last resort. The
+	 * file becomes a hole at that offset. Leaf BPs only - indirect
+	 * blocks are never auto-freed because that would silently lose
+	 * the entire sub-tree.
+	 * Requires DSF_REPAIR_CRYPT_MISMATCHES to be set.
+	 */
+	DSF_FREE_CRYPT_FALLBACK = 1<<3,
 } dsl_scan_flags_t;
 
-#define	DSL_SCAN_FLAGS_MASK (DSF_VISIT_DS_AGAIN)
+#define	DSL_SCAN_FLAGS_MASK (DSF_VISIT_DS_AGAIN | \
+	DSF_REPAIR_CRYPT_MISMATCHES | DSF_FREE_CRYPT_FALLBACK)
 
 typedef struct dsl_errorscrub_phys {
 	uint64_t dep_func; /* pool_scan_func_t */

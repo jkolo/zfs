@@ -8433,6 +8433,14 @@ typedef struct scrub_cbdata {
 	pool_scrub_cmd_t cb_scrub_cmd;
 	time_t	cb_date_start;
 	time_t	cb_date_end;
+	/*
+	 * Repair flags for the "encrypted block without BP_USES_CRYPT" bug
+	 * class (see PR #18587 detection + this commit's plumbing).
+	 * Recognized in CLI here; the ioctl plumbing and dsl_scan repair
+	 * logic land in subsequent commits.
+	 */
+	boolean_t cb_repair_crypt_mismatches;
+	boolean_t cb_free_crypt_fallback;
 } scrub_cbdata_t;
 
 static boolean_t
@@ -8540,6 +8548,8 @@ zpool_do_scrub(int argc, char **argv)
 	cb.cb_type = POOL_SCAN_SCRUB;
 	cb.cb_scrub_cmd = POOL_SCRUB_NORMAL;
 	cb.cb_date_start = cb.cb_date_end = 0;
+	cb.cb_repair_crypt_mismatches = B_FALSE;
+	cb.cb_free_crypt_fallback = B_FALSE;
 
 	boolean_t is_error_scrub = B_FALSE;
 	boolean_t is_pause = B_FALSE;
@@ -8547,8 +8557,25 @@ zpool_do_scrub(int argc, char **argv)
 	boolean_t is_txg_continue = B_FALSE;
 	boolean_t scrub_all = B_FALSE;
 
+	/*
+	 * Long-only options for the encrypted-BP-repair feature.
+	 * Numbered above 0xff so they don't collide with any short option.
+	 */
+	enum {
+		OPT_REPAIR_CRYPT_MISMATCHES = 256,
+		OPT_FREE_CRYPT_FALLBACK,
+	};
+	static const struct option long_opts[] = {
+		{ "repair-crypt-mismatches", no_argument, NULL,
+		    OPT_REPAIR_CRYPT_MISMATCHES },
+		{ "free-crypt-fallback", no_argument, NULL,
+		    OPT_FREE_CRYPT_FALLBACK },
+		{ NULL, 0, NULL, 0 },
+	};
+
 	/* check options */
-	while ((c = getopt(argc, argv, "aspweCE:S:")) != -1) {
+	while ((c = getopt_long(argc, argv, "aspweCE:S:", long_opts, NULL))
+	    != -1) {
 		switch (c) {
 		case 'a':
 			scrub_all = B_TRUE;
@@ -8578,11 +8605,30 @@ zpool_do_scrub(int argc, char **argv)
 		case 'C':
 			is_txg_continue = B_TRUE;
 			break;
+		case OPT_REPAIR_CRYPT_MISMATCHES:
+			cb.cb_repair_crypt_mismatches = B_TRUE;
+			break;
+		case OPT_FREE_CRYPT_FALLBACK:
+			cb.cb_free_crypt_fallback = B_TRUE;
+			break;
 		case '?':
 			(void) fprintf(stderr, gettext("invalid option '%c'\n"),
 			    optopt);
 			usage(B_FALSE);
 		}
+	}
+
+	if (cb.cb_free_crypt_fallback && !cb.cb_repair_crypt_mismatches) {
+		(void) fprintf(stderr, gettext("--free-crypt-fallback requires "
+		    "--repair-crypt-mismatches\n"));
+		usage(B_FALSE);
+	}
+
+	if (cb.cb_repair_crypt_mismatches) {
+		(void) fprintf(stderr, gettext("warning: "
+		    "--repair-crypt-mismatches is recognized but the repair "
+		    "logic is not yet wired through the ioctl path; this "
+		    "invocation will run a normal scrub.\n"));
 	}
 
 	if (is_pause && is_stop) {
