@@ -9690,6 +9690,13 @@ int
 spa_scan_range(spa_t *spa, pool_scan_func_t func, uint64_t txgstart,
     uint64_t txgend)
 {
+	return (spa_scan_with_flags(spa, func, 0, txgstart, txgend));
+}
+
+int
+spa_scan_with_flags(spa_t *spa, pool_scan_func_t func, uint64_t scan_flags,
+    uint64_t txgstart, uint64_t txgend)
+{
 	ASSERT0(spa_config_held(spa, SCL_ALL, RW_WRITER));
 
 	if (func >= POOL_SCAN_FUNCS || func == POOL_SCAN_NONE)
@@ -9716,7 +9723,8 @@ spa_scan_range(spa_t *spa, pool_scan_func_t func, uint64_t txgstart,
 	    !spa_feature_is_enabled(spa, SPA_FEATURE_HEAD_ERRLOG))
 		return (SET_ERROR(ENOTSUP));
 
-	return (dsl_scan(spa->spa_dsl_pool, func, txgstart, txgend));
+	return (dsl_scan_with_flags(spa->spa_dsl_pool, func, scan_flags,
+	    txgstart, txgend));
 }
 
 /*
@@ -11771,6 +11779,7 @@ EXPORT_SYMBOL(spa_l2cache_drop);
 /* scanning */
 EXPORT_SYMBOL(spa_scan);
 EXPORT_SYMBOL(spa_scan_range);
+EXPORT_SYMBOL(spa_scan_with_flags);
 EXPORT_SYMBOL(spa_scan_stop);
 
 /* spa syncing */

@@ -1924,6 +1924,7 @@ static const zfs_ioc_key_t zfs_keys_pool_scrub[] = {
 	{"scan_command",	DATA_TYPE_UINT64,	0},
 	{"scan_date_start",	DATA_TYPE_UINT64,	ZK_OPTIONAL},
 	{"scan_date_end",	DATA_TYPE_UINT64,	ZK_OPTIONAL},
+	{"scan_repair_flags",	DATA_TYPE_UINT64,	ZK_OPTIONAL},
 };
 
 static int
@@ -1932,7 +1933,7 @@ zfs_ioc_pool_scrub(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
 	spa_t *spa;
 	int error;
 	uint64_t scan_type, scan_cmd;
-	uint64_t date_start, date_end;
+	uint64_t date_start, date_end, scan_flags;
 
 	if (nvlist_lookup_uint64(innvl, "scan_type", &scan_type) != 0)
 		return (SET_ERROR(EINVAL));
@@ -1946,6 +1947,8 @@ zfs_ioc_pool_scrub(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
 		date_start = 0;
 	if (nvlist_lookup_uint64(innvl, "scan_date_end", &date_end) != 0)
 		date_end = 0;
+	if (nvlist_lookup_uint64(innvl, "scan_repair_flags", &scan_flags) != 0)
+		scan_flags = 0;
 
 	if ((error = spa_open(poolname, &spa, FTAG)) != 0)
 		return (error);
@@ -1955,7 +1958,7 @@ zfs_ioc_pool_scrub(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
 	} else if (scan_type == POOL_SCAN_NONE) {
 		error = spa_scan_stop(spa);
 	} else if (scan_cmd == POOL_SCRUB_FROM_LAST_TXG) {
-		error = spa_scan_range(spa, scan_type,
+		error = spa_scan_with_flags(spa, scan_type, scan_flags,
 		    spa_get_last_scrubbed_txg(spa), 0);
 	} else {
 		uint64_t txg_start, txg_end;
@@ -1975,7 +1978,8 @@ zfs_ioc_pool_scrub(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
 			mutex_exit(&spa->spa_txg_log_time_lock);
 		}
 
-		error = spa_scan_range(spa, scan_type, txg_start, txg_end);
+		error = spa_scan_with_flags(spa, scan_type, scan_flags,
+		    txg_start, txg_end);
 	}
 
 	spa_close(spa, FTAG);

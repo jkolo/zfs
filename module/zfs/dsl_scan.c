@@ -890,6 +890,7 @@ dsl_scan_setup_sync(void *arg, dmu_tx_t *tx)
 
 	scn->scn_phys.scn_func = setup_sync_arg->func;
 	scn->scn_phys.scn_state = DSS_SCANNING;
+	scn->scn_phys.scn_flags |= setup_sync_arg->scan_flags;
 	scn->scn_phys.scn_min_txg = setup_sync_arg->txgstart;
 	if (setup_sync_arg->txgend == 0) {
 		scn->scn_phys.scn_max_txg = tx->tx_txg;
@@ -995,6 +996,13 @@ int
 dsl_scan(dsl_pool_t *dp, pool_scan_func_t func, uint64_t txgstart,
     uint64_t txgend)
 {
+	return (dsl_scan_with_flags(dp, func, 0, txgstart, txgend));
+}
+
+int
+dsl_scan_with_flags(dsl_pool_t *dp, pool_scan_func_t func,
+    uint64_t scan_flags, uint64_t txgstart, uint64_t txgend)
+{
 	spa_t *spa = dp->dp_spa;
 	dsl_scan_t *scn = dp->dp_scan;
 	setup_sync_arg_t setup_sync_arg;
@@ -1055,6 +1063,7 @@ dsl_scan(dsl_pool_t *dp, pool_scan_func_t func, uint64_t txgstart,
 	setup_sync_arg.func = func;
 	setup_sync_arg.txgstart = txgstart;
 	setup_sync_arg.txgend = txgend;
+	setup_sync_arg.scan_flags = scan_flags & DSL_SCAN_FLAGS_MASK;
 
 	return (dsl_sync_task(spa_name(spa), dsl_scan_setup_check,
 	    dsl_scan_setup_sync, &setup_sync_arg, 0,

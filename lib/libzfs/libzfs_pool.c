@@ -2942,6 +2942,15 @@ int
 zpool_scan_range(zpool_handle_t *zhp, pool_scan_func_t func,
     pool_scrub_cmd_t cmd, time_t date_start, time_t date_end)
 {
+	return (zpool_scan_range_with_flags(zhp, func, cmd, date_start,
+	    date_end, 0));
+}
+
+int
+zpool_scan_range_with_flags(zpool_handle_t *zhp, pool_scan_func_t func,
+    pool_scrub_cmd_t cmd, time_t date_start, time_t date_end,
+    uint64_t scan_flags)
+{
 	char errbuf[ERRBUFLEN];
 	int err;
 	libzfs_handle_t *hdl = zhp->zpool_hdl;
@@ -2954,6 +2963,8 @@ zpool_scan_range(zpool_handle_t *zhp, pool_scan_func_t func,
 		    (uint64_t)date_start);
 		fnvlist_add_uint64(args, "scan_date_end", (uint64_t)date_end);
 	}
+	if (scan_flags != 0)
+		fnvlist_add_uint64(args, "scan_repair_flags", scan_flags);
 
 	err = lzc_scrub(ZFS_IOC_POOL_SCRUB, zhp->zpool_name, args, NULL);
 	fnvlist_free(args);

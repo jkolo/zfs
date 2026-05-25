@@ -65,6 +65,7 @@
 #include <sys/fm/util.h>
 #include <sys/fm/protocol.h>
 #include <sys/zfs_ioctl.h>
+#include <sys/dsl_scan.h>
 #include <sys/mount.h>
 #include <sys/sysmacros.h>
 #include <string.h>
@@ -8484,8 +8485,13 @@ scrub_callback(zpool_handle_t *zhp, void *data)
 		return (1);
 	}
 
-	err = zpool_scan_range(zhp, cb->cb_type, cb->cb_scrub_cmd,
-	    cb->cb_date_start, cb->cb_date_end);
+	uint64_t scan_flags = 0;
+	if (cb->cb_repair_crypt_mismatches)
+		scan_flags |= DSF_REPAIR_CRYPT_MISMATCHES;
+	if (cb->cb_free_crypt_fallback)
+		scan_flags |= DSF_FREE_CRYPT_FALLBACK;
+	err = zpool_scan_range_with_flags(zhp, cb->cb_type, cb->cb_scrub_cmd,
+	    cb->cb_date_start, cb->cb_date_end, scan_flags);
 	if (err == 0 && zpool_has_checkpoint(zhp) &&
 	    cb->cb_type == POOL_SCAN_SCRUB) {
 		(void) printf(gettext("warning: will not scrub state that "
@@ -8624,12 +8630,6 @@ zpool_do_scrub(int argc, char **argv)
 		usage(B_FALSE);
 	}
 
-	if (cb.cb_repair_crypt_mismatches) {
-		(void) fprintf(stderr, gettext("warning: "
-		    "--repair-crypt-mismatches is recognized but the repair "
-		    "logic is not yet wired through the ioctl path; this "
-		    "invocation will run a normal scrub.\n"));
-	}
 
 	if (is_pause && is_stop) {
 		(void) fprintf(stderr, gettext("invalid option "

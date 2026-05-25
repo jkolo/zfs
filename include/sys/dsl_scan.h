@@ -213,6 +213,15 @@ typedef struct {
 	pool_scan_func_t func;
 	uint64_t	 txgstart;
 	uint64_t	 txgend;
+	/*
+	 * Scan flags requested by the operator. Currently the
+	 * encrypted-BP repair flags (DSF_REPAIR_CRYPT_MISMATCHES,
+	 * DSF_FREE_CRYPT_FALLBACK) plumbed through from
+	 * 'zpool scrub --repair-crypt-mismatches' /
+	 * '--free-crypt-fallback'. dsl_scan_setup_sync ORs these
+	 * into scn_phys.scn_flags.
+	 */
+	uint64_t	 scan_flags;
 } setup_sync_arg_t;
 
 typedef struct dsl_scan_io_queue dsl_scan_io_queue_t;
@@ -225,6 +234,8 @@ void dsl_scan_setup_sync(void *, dmu_tx_t *);
 void dsl_scan_fini(struct dsl_pool *dp);
 void dsl_scan_sync(struct dsl_pool *, dmu_tx_t *);
 int dsl_scan_cancel(struct dsl_pool *);
+int dsl_scan_with_flags(struct dsl_pool *, pool_scan_func_t,
+    uint64_t scan_flags, uint64_t starttxg, uint64_t endtxg);
 int dsl_scan(struct dsl_pool *, pool_scan_func_t, uint64_t starttxg,
     uint64_t txgend);
 void dsl_scan_assess_vdev(struct dsl_pool *dp, vdev_t *vd);
