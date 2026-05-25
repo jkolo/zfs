@@ -5043,6 +5043,23 @@ zio_vdev_io_bypass(zio_t *zio)
  * managing the storage of encryption parameters and passing them to the
  * lower-level encryption functions.
  */
+/*
+ * If a ZINJECT_LOSE_CRYPT_FLAG handler matches this BP, strip
+ * BP_USES_CRYPT after the encryption pipeline has finished encoding
+ * the salt/IV/MAC. Produces the on-disk corruption shape (genuinely
+ * encrypted block, but BP reports no CRYPT) targeted by the scrub
+ * check in dsl_scan_visitbp() and the Mode 1.5 / Mode 3 repair logic.
+ */
+static inline void
+zio_encrypt_maybe_inject_lose_crypt(zio_t *zio, blkptr_t *bp)
+{
+	if (!zio_injection_enabled)
+		return;
+	if (zio_handle_lose_crypt_flag_injection(zio->io_spa,
+	    &zio->io_bookmark, BP_GET_TYPE(bp)))
+		BP_SET_CRYPT(bp, B_FALSE);
+}
+
 static zio_t *
 zio_encrypt(zio_t *zio)
 {
@@ -5097,6 +5114,7 @@ zio_encrypt(zio_t *zio)
 
 		if (DMU_OT_IS_ENCRYPTED(ot))
 			zio_crypt_encode_params_bp(bp, zp->zp_salt, zp->zp_iv);
+		zio_encrypt_maybe_inject_lose_crypt(zio, bp);
 		return (zio);
 	}
 
@@ -5107,6 +5125,7 @@ zio_encrypt(zio_t *zio)
 		    zio->io_orig_abd, BP_GET_LSIZE(bp), BP_SHOULD_BYTESWAP(bp),
 		    mac));
 		zio_crypt_encode_mac_bp(bp, mac);
+		zio_encrypt_maybe_inject_lose_crypt(zio, bp);
 		return (zio);
 	}
 
@@ -5120,6 +5139,7 @@ zio_encrypt(zio_t *zio)
 		BP_SET_CRYPT(bp, B_TRUE);
 		VERIFY0(spa_do_crypt_objset_mac_abd(B_TRUE, spa, dsobj,
 		    zio->io_abd, psize, BP_SHOULD_BYTESWAP(bp)));
+		zio_encrypt_maybe_inject_lose_crypt(zio, bp);
 		return (zio);
 	}
 
@@ -5129,6 +5149,7 @@ zio_encrypt(zio_t *zio)
 		VERIFY0(spa_do_crypt_mac_abd(B_TRUE, spa, dsobj,
 		    zio->io_abd, psize, mac));
 		zio_crypt_encode_mac_bp(bp, mac);
+		zio_encrypt_maybe_inject_lose_crypt(zio, bp);
 		return (zio);
 	}
 
@@ -5186,6 +5207,7 @@ zio_encrypt(zio_t *zio)
 		}
 	}
 
+	zio_encrypt_maybe_inject_lose_crypt(zio, bp);
 	return (zio);
 }
 

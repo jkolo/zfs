@@ -220,11 +220,18 @@ struct errstr {
 	int		err;
 	const char	*str;
 };
+/*
+ * Sentinel for "lose-crypt-flag": not a real errno, not stored in
+ * zi_error. Maps to ZINJECT_LOSE_CRYPT_FLAG zi_cmd, which the kernel
+ * uses to strip BP_USES_CRYPT after the encryption pipeline completes.
+ */
+#define	ZINJECT_LOSE_CRYPT_FLAG_SENTINEL	(-2)
 static const struct errstr errstrtable[] = {
 	{ EIO,		"io" },
 	{ ECKSUM,	"checksum" },
 	{ EINVAL,	"decompress" },
 	{ EACCES,	"decrypt" },
+	{ ZINJECT_LOSE_CRYPT_FLAG_SENTINEL,	"lose-crypt-flag" },
 	{ ENXIO,	"nxio" },
 	{ ECHILD,	"dtl" },
 	{ EILSEQ,	"corrupt" },
@@ -383,7 +390,11 @@ usage(void)
 	    "\n"
 	    "\t\t-q\tQuiet mode.  Only print out the handler number added.\n"
 	    "\t\t-e\tInject a specific error.  Must be one of 'io',\n"
-	    "\t\t\t'checksum', 'decompress', or 'decrypt'.  Default is 'io'.\n"
+	    "\t\t\t'checksum', 'decompress', 'decrypt', or\n"
+	    "\t\t\t'lose-crypt-flag'.  Default is 'io'.\n"
+	    "\t\t\t'lose-crypt-flag' strips BP_USES_CRYPT from the next\n"
+	    "\t\t\tBP write matching the bookmark, producing a block that\n"
+	    "\t\t\tis genuinely encrypted but reports no CRYPT in its BP.\n"
 	    "\t\t-C\tInject the given error only into specific DVAs. The\n"
 	    "\t\t\tDVAs should be specified as a list of 0-indexed DVAs\n"
 	    "\t\t\tseparated by commas (ex. '0,2').\n"
@@ -1028,8 +1039,8 @@ main(int argc, char **argv)
 			if (error < 0) {
 				(void) fprintf(stderr, "invalid error type "
 				    "'%s': must be one of: io decompress "
-				    "decrypt nxio dtl corrupt noop "
-				    "io-prefail\n",
+				    "decrypt lose-crypt-flag nxio dtl "
+				    "corrupt noop io-prefail\n",
 				    optarg);
 				usage();
 				libzfs_fini(g_zfs);
@@ -1454,10 +1465,12 @@ main(int argc, char **argv)
 		}
 
 		if (dvas != 0) {
-			if (error == EACCES || error == EINVAL) {
+			if (error == EACCES || error == EINVAL ||
+			    error == ZINJECT_LOSE_CRYPT_FLAG_SENTINEL) {
 				(void) fprintf(stderr, "the '-C' option may "
 				    "not be used with logical data errors "
-				    "'decrypt' and 'decompress'\n");
+				    "'decrypt', 'decompress', or "
+				    "'lose-crypt-flag'\n");
 				libzfs_fini(g_zfs);
 				return (1);
 			}
@@ -1487,6 +1500,16 @@ main(int argc, char **argv)
 			 * not found.
 			 */
 			error = ECKSUM;
+		} else if (error == ZINJECT_LOSE_CRYPT_FLAG_SENTINEL) {
+			if (type != TYPE_DATA) {
+				(void) fprintf(stderr, "lose-crypt-flag "
+				    "may only be injected for 'data' types\n");
+				libzfs_fini(g_zfs);
+				return (1);
+			}
+
+			record.zi_cmd = ZINJECT_LOSE_CRYPT_FLAG;
+			error = 0;
 		} else if (record.zi_cmd == ZINJECT_UNINITIALIZED) {
 			record.zi_cmd = ZINJECT_DATA_FAULT;
 			if (!error)

@@ -710,17 +710,18 @@ zpool_feature_init(void)
 	}
 
 	{
-		static const spa_feature_t encrypted_bp_repair_deps[] = {
+		static const spa_feature_t crypt_repair_deps[] = {
 			SPA_FEATURE_ENCRYPTION,
 			SPA_FEATURE_NONE
 		};
-		zfeature_register(SPA_FEATURE_ENCRYPTED_BP_REPAIR,
-		    "org.openzfs:encrypted_bp_repair",
-		    "encrypted_bp_repair",
-		    "Track and repair BP_USES_CRYPT mismatches on encrypted "
-		    "datasets via 'zpool scrub --repair-crypt-mismatches'.",
+		zfeature_register(SPA_FEATURE_CRYPT_REPAIR,
+		    "org.openzfs:crypt_repair",
+		    "crypt_repair",
+		    "Track repair queue and counters for BP_USES_CRYPT "
+		    "mismatches detected by scrub, used by "
+		    "'zpool scrub --repair-crypt-mismatches'.",
 		    ZFEATURE_FLAG_READONLY_COMPAT,
-		    ZFEATURE_TYPE_BOOLEAN, encrypted_bp_repair_deps, sfeatures);
+		    ZFEATURE_TYPE_BOOLEAN, crypt_repair_deps, sfeatures);
 	}
 
 	{

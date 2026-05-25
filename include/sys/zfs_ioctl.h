@@ -456,6 +456,24 @@ typedef enum zinject_type {
 	ZINJECT_DELAY_IMPORT,
 	ZINJECT_DELAY_EXPORT,
 	ZINJECT_DELAY_READY,
+	/*
+	 * ZINJECT_LOSE_CRYPT_FLAG: clear BP_USES_CRYPT on the next BP write
+	 * matching the recorded bookmark. The encryption pipeline runs as
+	 * normal (salt/IV/MAC are computed and stored in the BP), but the
+	 * CRYPT flag is stripped post-pipeline, before the BP reaches its
+	 * parent dnode/indirect block.
+	 *
+	 * Produces on-disk state where a block is genuinely encrypted but
+	 * its BP reports as unencrypted - the corruption shape detected by
+	 * the scrub check in dsl_scan_visitbp() (PR #18587) and targeted by
+	 * the Mode 1.5 / Mode 3 repair logic.
+	 *
+	 * Bookmark matched on (objset, object, level, blkid). Level allows
+	 * targeting both leaf (level 0) and indirect (level > 0) BPs.
+	 *
+	 * Modeled on the no-op injection added in PR #16085.
+	 */
+	ZINJECT_LOSE_CRYPT_FLAG,
 } zinject_type_t;
 
 typedef enum zinject_iotype {

@@ -232,6 +232,46 @@ zio_handle_decrypt_injection(spa_t *spa, const zbookmark_phys_t *zb,
 }
 
 /*
+ * Inject a "lost CRYPT flag" corruption: when a BP on an encrypted
+ * dataset matches the recorded bookmark, the caller in the encryption
+ * pipeline strips BP_USES_CRYPT after the salt/IV/MAC have been
+ * computed and stored. The on-disk block is genuinely encrypted but
+ * its BP appears unencrypted - exactly the corruption shape detected
+ * by the scrub check in dsl_scan_visitbp() and targeted by the
+ * Mode 1.5 / Mode 3 repair logic.
+ *
+ * Returns B_TRUE if the BP should have its CRYPT flag cleared.
+ * Bookmark matched on (objset, object, level, blkid); level allows
+ * targeting both leaf (level 0) and indirect (level > 0) BPs.
+ */
+boolean_t
+zio_handle_lose_crypt_flag_injection(spa_t *spa, const zbookmark_phys_t *zb,
+    uint64_t type)
+{
+	boolean_t injected = B_FALSE;
+	inject_handler_t *handler;
+
+	rw_enter(&inject_lock, RW_READER);
+
+	for (handler = list_head(&inject_handlers); handler != NULL;
+	    handler = list_next(&inject_handlers, handler)) {
+
+		if (spa != handler->zi_spa ||
+		    handler->zi_record.zi_cmd != ZINJECT_LOSE_CRYPT_FLAG)
+			continue;
+
+		if (zio_match_handler(zb, type, ZI_NO_DVA,
+		    &handler->zi_record, 0)) {
+			injected = B_TRUE;
+			break;
+		}
+	}
+
+	rw_exit(&inject_lock);
+	return (injected);
+}
+
+/*
  * If this is a physical I/O for a vdev child determine which DVA it is
  * for. We iterate backwards through the DVAs matching on the offset so
  * that we end up with ZI_NO_DVA (-1) if we don't find a match.
