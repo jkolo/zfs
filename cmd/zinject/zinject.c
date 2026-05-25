@@ -224,8 +224,13 @@ struct errstr {
  * Sentinel for "lose-crypt-flag": not a real errno, not stored in
  * zi_error. Maps to ZINJECT_LOSE_CRYPT_FLAG zi_cmd, which the kernel
  * uses to strip BP_USES_CRYPT after the encryption pipeline completes.
+ *
+ * Must be positive (str_to_err returns -1 for "not found", and the
+ * caller treats every negative value the same way) and far outside
+ * the Linux errno range (~1..200) so it never collides with a real
+ * errno that some future entry might want.
  */
-#define	ZINJECT_LOSE_CRYPT_FLAG_SENTINEL	(-2)
+#define	ZINJECT_LOSE_CRYPT_FLAG_SENTINEL	(0x7fff0001)
 static const struct errstr errstrtable[] = {
 	{ EIO,		"io" },
 	{ ECKSUM,	"checksum" },
