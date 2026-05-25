@@ -42,6 +42,8 @@
 #include <sys/arc_impl.h>
 #include <sys/zap.h>
 #include <sys/zio.h>
+#include <sys/zio_compress.h>
+#include <sys/zio_crypt.h>
 #include <sys/zfs_context.h>
 #include <sys/fs/zfs.h>
 #include <sys/zfs_znode.h>
@@ -2485,6 +2487,145 @@ dsl_scan_crypt_repair_verify_leaf(spa_t *spa, const blkptr_t *bp,
 }
 
 /*
+ * Mode 1.5 indirect MAC-of-MAC verification.
+ *
+ * Indirect blocks store an array of child block pointers. On
+ * encrypted datasets the parent BP's blk_cksum carries a HMAC-SHA512
+ * computed over the children's MACs (the "MAC of MACs"), not a
+ * regular data MAC. Verifying that this MAC-of-MAC matches confirms
+ * the on-disk indirect block is the genuine encrypted-dataset
+ * indirect that lost only its CRYPT flag.
+ *
+ * Unlike the leaf verify, the indirect block's plaintext layout
+ * (the BP array) is required to recompute the MAC, so we must
+ * decompress before passing it to
+ * zio_crypt_do_indirect_mac_checksum_abd(). This mirrors the
+ * pattern in zio_decrypt() at zio.c:599-622.
+ *
+ * Same arc_read-with-stack-local-BP trick as the leaf path is used
+ * to bypass the normal checksum verify.
+ *
+ * Returns 0 if MAC-of-MAC matches (Mode 1.5 candidate),
+ * ECKSUM if it fails (no Mode 3 for indirect by design - free of
+ *   an indirect would silently drop the whole sub-tree),
+ * other errno on IO / decompress / setup failures.
+ */
+static int
+dsl_scan_crypt_repair_verify_indirect(spa_t *spa, const blkptr_t *bp,
+    const zbookmark_phys_t *zb)
+{
+	blkptr_t bp_with_crypt;
+	arc_buf_t *buf = NULL;
+	arc_flags_t arc_flags = ARC_FLAG_WAIT;
+	int zio_flags = ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE |
+	    ZIO_FLAG_RAW | ZIO_FLAG_SCAN_THREAD;
+	uint64_t psize = BP_GET_PSIZE(bp);
+	uint64_t lsize = BP_GET_LSIZE(bp);
+	uint8_t mac[ZIO_DATA_MAC_LEN];
+	abd_t *raw_abd, *decompressed = NULL, *verify_abd;
+	int err;
+
+	bp_with_crypt = *bp;
+	BP_SET_CRYPT(&bp_with_crypt, B_TRUE);
+	zio_crypt_decode_mac_bp(&bp_with_crypt, mac);
+
+	err = arc_read(NULL, spa, &bp_with_crypt, arc_getbuf_func,
+	    &buf, ZIO_PRIORITY_SCRUB, zio_flags, &arc_flags, zb);
+	if (err != 0)
+		return (err);
+
+	raw_abd = abd_get_from_buf(buf->b_data, psize);
+
+	if (BP_GET_COMPRESS(bp) != ZIO_COMPRESS_OFF) {
+		uint8_t level = 0;
+		decompressed = abd_alloc_linear(lsize, B_TRUE);
+		err = zio_decompress_data(BP_GET_COMPRESS(bp),
+		    raw_abd, decompressed, psize, lsize, &level);
+		if (err != 0) {
+			abd_free(decompressed);
+			abd_free(raw_abd);
+			arc_buf_destroy(buf, &buf);
+			return (SET_ERROR(EIO));
+		}
+		verify_abd = decompressed;
+	} else {
+		verify_abd = raw_abd;
+	}
+
+	err = zio_crypt_do_indirect_mac_checksum_abd(B_FALSE,
+	    verify_abd, lsize, BP_SHOULD_BYTESWAP(bp), mac);
+
+	if (decompressed != NULL)
+		abd_free(decompressed);
+	abd_free(raw_abd);
+	arc_buf_destroy(buf, &buf);
+	return (err);
+}
+
+/*
+ * When --repair-crypt-mismatches is set, classify a detected
+ * BP_USES_CRYPT mismatch and log the disposition. Atomic repair
+ * dispatch lands in a follow-up commit; this helper currently only
+ * surfaces the classification via zfs_dbgmsg.
+ *
+ * Called from dsl_scan_visitbp() after the detection block. Both
+ * leaf and indirect BPs are handled; indirect Mode 3 is intentionally
+ * disabled (would orphan the subtree below).
+ */
+static void
+dsl_scan_classify_crypt_mismatch(spa_t *spa, const blkptr_t *bp,
+    const zbookmark_phys_t *zb, dsl_dataset_t *ds)
+{
+	const char *reason = NULL;
+	int verify_err;
+	const char *kind;
+
+	if (!dsl_scan_crypt_repair_eligible(bp, zb, ds, &reason)) {
+		zfs_dbgmsg("scrub: BP at {%llu,%llu,%u,%llu} skipped "
+		    "for crypt repair: %s",
+		    (u_longlong_t)zb->zb_objset,
+		    (u_longlong_t)zb->zb_object,
+		    (uint_t)zb->zb_level,
+		    (u_longlong_t)zb->zb_blkid, reason);
+		return;
+	}
+
+	if (BP_GET_LEVEL(bp) == 0) {
+		kind = "leaf";
+		verify_err =
+		    dsl_scan_crypt_repair_verify_leaf(spa, bp, zb);
+	} else {
+		kind = "indirect";
+		verify_err =
+		    dsl_scan_crypt_repair_verify_indirect(spa, bp, zb);
+	}
+
+	if (verify_err == 0) {
+		zfs_dbgmsg("scrub: %s BP at {%llu,%llu,%u,%llu} MAC "
+		    "verifies - Mode 1.5 candidate", kind,
+		    (u_longlong_t)zb->zb_objset,
+		    (u_longlong_t)zb->zb_object,
+		    (uint_t)zb->zb_level,
+		    (u_longlong_t)zb->zb_blkid);
+	} else if (BP_GET_LEVEL(bp) == 0) {
+		zfs_dbgmsg("scrub: leaf BP at {%llu,%llu,%u,%llu} MAC "
+		    "verify failed (err %d) - Mode 3 candidate",
+		    (u_longlong_t)zb->zb_objset,
+		    (u_longlong_t)zb->zb_object,
+		    (uint_t)zb->zb_level,
+		    (u_longlong_t)zb->zb_blkid, verify_err);
+	} else {
+		zfs_dbgmsg("scrub: indirect BP at {%llu,%llu,%u,%llu} "
+		    "MAC-of-MAC verify failed (err %d) - no auto repair "
+		    "(would orphan subtree)",
+		    (u_longlong_t)zb->zb_objset,
+		    (u_longlong_t)zb->zb_object,
+		    (uint_t)zb->zb_level,
+		    (u_longlong_t)zb->zb_blkid, verify_err);
+	}
+}
+
+/*
  * The arguments are in this order because mdb can only print the
  * first 5; we want them to be useful.
  */
@@ -2561,61 +2702,8 @@ dsl_scan_visitbp(const blkptr_t *bp, const zbookmark_phys_t *zb,
 			 */
 			if (scn->scn_phys.scn_flags &
 			    DSF_REPAIR_CRYPT_MISMATCHES) {
-				const char *reason = NULL;
-				boolean_t eligible =
-				    dsl_scan_crypt_repair_eligible(bp, zb,
-				    ds, &reason);
-				if (!eligible) {
-					zfs_dbgmsg("scrub: BP at "
-					    "{%llu,%llu,%u,%llu} skipped "
-					    "for crypt repair: %s",
-					    (u_longlong_t)zb->zb_objset,
-					    (u_longlong_t)zb->zb_object,
-					    (uint_t)zb->zb_level,
-					    (u_longlong_t)zb->zb_blkid,
-					    reason);
-				} else if (BP_GET_LEVEL(bp) == 0) {
-					int verify_err =
-					    dsl_scan_crypt_repair_verify_leaf(
-					    dp->dp_spa, bp, zb);
-					if (verify_err == 0) {
-						zfs_dbgmsg("scrub: BP at "
-						    "{%llu,%llu,%u,%llu} "
-						    "MAC verifies - "
-						    "Mode 1.5 candidate",
-						    (u_longlong_t)
-						    zb->zb_objset,
-						    (u_longlong_t)
-						    zb->zb_object,
-						    (uint_t)zb->zb_level,
-						    (u_longlong_t)
-						    zb->zb_blkid);
-					} else {
-						zfs_dbgmsg("scrub: BP at "
-						    "{%llu,%llu,%u,%llu} "
-						    "MAC verify failed "
-						    "(err %d) - Mode 3 "
-						    "candidate",
-						    (u_longlong_t)
-						    zb->zb_objset,
-						    (u_longlong_t)
-						    zb->zb_object,
-						    (uint_t)zb->zb_level,
-						    (u_longlong_t)
-						    zb->zb_blkid,
-						    verify_err);
-					}
-				} else {
-					zfs_dbgmsg("scrub: BP at "
-					    "{%llu,%llu,%u,%llu} indirect "
-					    "level repair not yet "
-					    "implemented (Mode 1.5 "
-					    "MAC-of-MAC verify pending)",
-					    (u_longlong_t)zb->zb_objset,
-					    (u_longlong_t)zb->zb_object,
-					    (uint_t)zb->zb_level,
-					    (u_longlong_t)zb->zb_blkid);
-				}
+				dsl_scan_classify_crypt_mismatch(
+				    dp->dp_spa, bp, zb, ds);
 			}
 		}
 	}
