@@ -349,6 +349,83 @@ ZFS attempts to bring the device online automatically.
 Device attachment detection is hardware-dependent
 and might not be supported on all platforms.
 .
+.Ss Encryption Flag Mismatches Repair
+On natively encrypted datasets every block pointer must carry the
+.Sy BP_USES_CRYPT
+flag.
+A small class of rare write-path corruption can leave that flag clear
+on otherwise-encrypted blocks; the symptom is an
+.Sy EIO
+on read of the affected offset and, historically, a kernel panic in
+.Fn zfs_mknode .
+Issues
+.Pq see Sy openzfs/zfs#14330 #15275 #15464 #16065
+have been reported intermittently from ZFS 2.0.x through 2.4.x.
+.Pp
+.Nm zpool Cm scrub
+detects this state and reports the affected file in
+.Nm zpool Cm status Fl v .
+With the
+.Sy crypt_repair
+feature enabled
+.Pq read-compatible ,
+the
+.Fl -repair-crypt-mismatches
+scrub flag attempts in-kernel recovery per BP, in this order:
+.Bl -bullet -compact -offset indent
+.It
+.Em Smart flip
+.Pq Mode 1.5 :
+decrypt the on-disk block under the dataset key, recompute the MAC, and
+if it matches the value stored in
+.Sy blk_cksum ,
+restore the CRYPT flag on the parent dnode or indirect block.
+Lossless - no data is rewritten.
+.It
+.Em Hole and free
+.Pq Mode 3 .
+If MAC verification fails on a leaf block and the operator opted in
+with
+.Fl -free-crypt-fallback ,
+the leaf is freed and the parent's reference becomes a hole.
+The affected file accumulates zeros at that offset; the rest of the
+file remains accessible.
+Destructive - not enabled unless explicitly requested.
+.It
+.Em Log only .
+For an indirect BP whose MAC-of-MAC verification fails, the block is
+left in
+.Nm zpool Cm status Fl v
+for operator follow-up.
+Automatic free of an indirect would orphan its entire subtree, so it
+is not attempted.
+.El
+.Pp
+Several BP classes are skipped without attempting repair, with the
+reason logged via
+.Nm zpool Cm events :
+snapshots, MOS objects, special dnodes
+.Pq Sy DMU_OBJECT_IS_SPECIAL
+where
+.Sy dn_dbuf
+can be NULL,
+.Sy ZIL
+blocks,
+.Sy DMU_OT_OBJSET
+blocks
+.Pq separate authenticated-MAC API ,
+gang blocks, deduplicated BPs, and datasets whose key is not loaded.
+.Pp
+An alternative recovery path that does not require kernel changes is
+.Nm zfs Cm send Fl U
+plus
+.Nm zfs Cm receive
+onto a freshly created pool; the encryption pipeline runs again on
+ingest and produces correct BPs.
+This works without the
+.Sy crypt_repair
+feature but is heavier-weight than the in-kernel paths above.
+.
 .Ss Hot Spares
 ZFS allows devices to be associated with pools as
 .Qq hot spares .

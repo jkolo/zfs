@@ -42,6 +42,8 @@
 .Op Fl w
 .Op Fl S Ar date
 .Op Fl E Ar date
+.Op Fl -repair-crypt-mismatches
+.Op Fl -free-crypt-fallback
 .Fl a Ns | Ns Ar pool Ns …
 .
 .Sh DESCRIPTION
@@ -166,7 +168,80 @@ Specifying dates prior to enabling this feature will result in scrubbing
 starting from the date the pool was created.
 If the time was moved backward manually the data range may become inaccurate.
 .El
-.Sh EXAMPLES
+.It Fl -repair-crypt-mismatches
+Attempt in-kernel repair of any block pointer found on an encrypted
+dataset that lacks the
+.Sy BP_USES_CRYPT
+flag.
+This corruption class has been reported intermittently on natively
+encrypted datasets across ZFS 2.0.x through 2.4.x; without this flag
+the read path returns
+.Sy EIO
+and the create path historically panicked in
+.Fn zfs_mknode .
+.Pp
+When set, the scrub examines each detected mismatch and dispatches one
+of two repair paths:
+.Bl -bullet -compact -offset indent
+.It
+.Em Smart flip
+.Pq Mode 1.5 .
+If decryption of the on-disk block succeeds and the MAC stored in
+.Sy blk_cksum
+verifies under the dataset key, the block is genuinely encrypted
+ciphertext that lost only its CRYPT flag in flight.
+The flag is restored atomically on the parent dnode or indirect block;
+no data is rewritten.
+This repair is lossless.
+.It
+.Em No repair .
+If MAC verification fails, the on-disk bytes are not legitimate
+ciphertext under the dataset key.
+The block is logged in
+.Nm zpool Cm status Fl v
+for the operator to handle; no further action is taken unless
+.Fl -free-crypt-fallback
+is also set
+.Pq see below .
+.El
+.Pp
+Several BP classes are intentionally skipped and recorded as such in
+.Nm zpool Cm events :
+snapshot datasets (the parent BP is immutable), MOS objects, special
+dnodes
+.Pq dn_dbuf can be NULL ,
+ZIL blocks, objset blocks
+.Pq use a different authenticated MAC API ,
+gang blocks, deduplicated BPs
+.Pq the DDT key includes the CRYPT bit ,
+and datasets whose encryption key is not loaded.
+.Pp
+The repair pipeline requires the
+.Sy feature@crypt_repair
+pool feature to be enabled.
+Indirect blocks are MAC-of-MAC verified the same way as leaves; only
+the destructive
+.Fl -free-crypt-fallback
+path is restricted to leaves.
+.It Fl -free-crypt-fallback
+When a leaf block fails Mode 1.5 MAC verification under
+.Fl -repair-crypt-mismatches ,
+free the leaf and replace the parent's reference with a hole.
+The affected file accumulates zeros at the offset of the freed block;
+the rest of the file remains accessible.
+.Pp
+This flag is destructive
+.Pq the original bytes are released ,
+opt-in only, and applies to leaf BPs only.
+Indirect blocks are never auto-freed because doing so would orphan their
+entire subtree; an unrepairable indirect is left in
+.Nm zpool Cm status Fl v
+for the operator to handle out of band.
+.Pp
+.Fl -free-crypt-fallback
+requires
+.Fl -repair-crypt-mismatches
+to also be set.
 .Ss Example 1
 Status of pool with ongoing scrub:
 .sp
