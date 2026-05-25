@@ -1633,7 +1633,30 @@ typedef struct zfs_rewrite_args {
 } zfs_rewrite_args_t;
 
 /* zfs_rewrite_args flags */
-#define	ZFS_REWRITE_PHYSICAL	0x1	/* Preserve logical birth time. */
+#define	ZFS_REWRITE_PHYSICAL		0x1 /* Preserve logical birth time. */
+/*
+ * ZFS_REWRITE_FORCE_REENCRYPT: bypass the dbuf EIO returned for
+ * encrypted-dataset block pointers that lack BP_USES_CRYPT (the
+ * corruption shape detected by the scrub check in dsl_scan_visitbp,
+ * see openzfs/zfs PR #18587). For each affected block the kernel
+ * does an arc_read + spa_do_crypt_abd probe under a stack-local BP
+ * with CRYPT forced TRUE:
+ *
+ *   - MAC verifies (block is genuine ciphertext): the rewrite is
+ *     refused with EIO and a "use scrub --repair-crypt-mismatches"
+ *     suggestion logged via spa_log_error. Rewriting a Mode 1.5
+ *     candidate through this flag would double-encrypt the data
+ *     and destroy it.
+ *   - MAC fails (block is plaintext): the on-disk bytes are
+ *     surfaced to the dbuf layer as if they were plaintext and the
+ *     dbuf is marked dirty. Sync runs the dataset's normal write
+ *     pipeline, which encrypts the bytes and produces a fresh BP
+ *     with BP_USES_CRYPT set correctly.
+ *
+ * Opt-in only - the plaintext-on-encrypted scenario it targets is
+ * rare (the historical zfs_clone_range vector was fixed by #15465).
+ */
+#define	ZFS_REWRITE_FORCE_REENCRYPT	0x2
 
 #define	ZFS_IOC_REWRITE		_IOW(0x83, 3, zfs_rewrite_args_t)
 

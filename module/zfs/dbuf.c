@@ -1620,9 +1620,19 @@ dbuf_read_impl(dmu_buf_impl_t *db, dnode_t *dn, zio_t *zio, dmu_flags_t flags,
 
 	/*
 	 * All bps of an encrypted os should have the encryption bit set.
-	 * If this is not true it indicates tampering and we report an error.
+	 * If this is not true it indicates tampering and we report an
+	 * error.
+	 *
+	 * DMU_READ_FORCE_LOST_CRYPT bypasses this branch and is used
+	 * only by the zfs_rewrite --force-reencrypt path, which has
+	 * already MAC-verified that the on-disk bytes are not ciphertext
+	 * (otherwise it would have refused) and now wants to surface
+	 * them to user-space so a subsequent dmu_buf_will_dirty() can
+	 * push them through the normal write pipeline and produce a
+	 * correctly encrypted BP.
 	 */
-	if (db->db_objset->os_encrypted && !BP_USES_CRYPT(bp)) {
+	if (db->db_objset->os_encrypted && !BP_USES_CRYPT(bp) &&
+	    !(flags & DMU_READ_FORCE_LOST_CRYPT)) {
 		spa_log_error(db->db_objset->os_spa, &zb,
 		    BP_GET_PHYSICAL_BIRTH(bp));
 		err = SET_ERROR(EIO);

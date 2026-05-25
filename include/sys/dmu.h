@@ -573,6 +573,15 @@ typedef enum dmu_flags {
 	DMU_PARTIAL_FIRST	= 1 << 7, /* First partial access. */
 	DMU_PARTIAL_MORE	= 1 << 8, /* Following partial access. */
 	DMU_KEEP_CACHING	= 1 << 9, /* Don't affect caching. */
+	/*
+	 * Skip the "encrypted objset but BP_USES_CRYPT is clear"
+	 * EIO that dbuf_read_impl() normally returns for that
+	 * corruption shape (see dbuf.c). Intended only for the
+	 * zfs_rewrite --force-reencrypt path, which has already
+	 * MAC-verified that the on-disk bytes are not ciphertext
+	 * before reaching dbuf_read.
+	 */
+	DMU_READ_FORCE_LOST_CRYPT = 1 << 10,
 } dmu_flags_t;
 
 /*

@@ -49,6 +49,7 @@
 #include <sys/fs/zfs.h>
 #include <sys/dmu.h>
 #include <sys/dmu_objset.h>
+#include <sys/arc.h>
 #include <sys/dsl_crypt.h>
 #include <sys/dsl_dataset.h>
 #include <sys/spa.h>
@@ -1107,13 +1108,70 @@ zfs_write(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
  *	RETURN:	0 if success
  *		error code if failure
  */
+/*
+ * Mode 2B helper: check whether the on-disk bytes addressed by `bp`
+ * decrypt and MAC-verify under the dataset key. Reads raw bytes via
+ * arc_read with a stack-local copy of bp that has CRYPT forced TRUE
+ * (so arc_read takes the encrypted-BP path that skips the normal
+ * checksum verify, and ZIO_FLAG_RAW skips the decrypt pipeline),
+ * then runs spa_do_crypt_abd over the PSIZE ciphertext.
+ *
+ * Returns 0 if MAC verifies (block IS legitimate ciphertext - the
+ *   caller should refuse the rewrite to avoid double-encrypting).
+ * Returns ECKSUM if MAC fails (bytes are plaintext or unrelated to
+ *   the stored MAC - safe for the caller to push through the normal
+ *   write pipeline as plaintext).
+ * Returns other errno on IO / setup failures.
+ */
+static int
+zfs_rewrite_mac_verify_lost_crypt(spa_t *spa, const blkptr_t *bp,
+    const zbookmark_phys_t *zb)
+{
+	blkptr_t bp_with_crypt;
+	arc_buf_t *buf = NULL;
+	arc_flags_t arc_flags = ARC_FLAG_WAIT;
+	int zio_flags = ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE |
+	    ZIO_FLAG_RAW;
+	uint64_t psize = BP_GET_PSIZE(bp);
+	uint8_t salt[ZIO_DATA_SALT_LEN];
+	uint8_t iv[ZIO_DATA_IV_LEN];
+	uint8_t mac[ZIO_DATA_MAC_LEN];
+	abd_t *cabd, *pabd;
+	boolean_t no_crypt = B_FALSE;
+	int err;
+
+	bp_with_crypt = *bp;
+	BP_SET_CRYPT(&bp_with_crypt, B_TRUE);
+
+	zio_crypt_decode_params_bp(&bp_with_crypt, salt, iv);
+	zio_crypt_decode_mac_bp(&bp_with_crypt, mac);
+
+	err = arc_read(NULL, spa, &bp_with_crypt, arc_getbuf_func,
+	    &buf, ZIO_PRIORITY_SYNC_READ, zio_flags, &arc_flags, zb);
+	if (err != 0)
+		return (err);
+
+	cabd = abd_get_from_buf(buf->b_data, psize);
+	pabd = abd_alloc_for_io(psize, B_FALSE);
+
+	err = spa_do_crypt_abd(B_FALSE, spa, zb, BP_GET_TYPE(bp),
+	    BP_GET_DEDUP(bp), BP_SHOULD_BYTESWAP(bp),
+	    salt, iv, mac, psize, pabd, cabd, &no_crypt);
+
+	abd_free(pabd);
+	abd_free(cabd);
+	arc_buf_destroy(buf, &buf);
+	return (err);
+}
+
 int
 zfs_rewrite(znode_t *zp, uint64_t off, uint64_t len, uint64_t flags,
     uint64_t arg)
 {
 	int error;
 
-	if ((flags & ~ZFS_REWRITE_PHYSICAL) != 0 || arg != 0)
+	if ((flags & ~(ZFS_REWRITE_PHYSICAL | ZFS_REWRITE_FORCE_REENCRYPT))
+	    != 0 || arg != 0)
 		return (SET_ERROR(EINVAL));
 
 	zfsvfs_t *zfsvfs = ZTOZSB(zp);
@@ -1204,8 +1262,11 @@ zfs_rewrite(znode_t *zp, uint64_t off, uint64_t len, uint64_t flags,
 		/* Mark all dbufs within range as dirty to trigger rewrite. */
 		dmu_buf_t **dbp;
 		int numbufs;
+		dmu_flags_t read_flags = DMU_READ_PREFETCH | DMU_UNCACHEDIO;
+		if (flags & ZFS_REWRITE_FORCE_REENCRYPT)
+			read_flags |= DMU_READ_FORCE_LOST_CRYPT;
 		error = dmu_buf_hold_array_by_dnode(dn, off, n, TRUE, FTAG,
-		    &numbufs, &dbp, DMU_READ_PREFETCH | DMU_UNCACHEDIO);
+		    &numbufs, &dbp, read_flags);
 		if (error) {
 			dmu_tx_commit(tx);
 			break;
@@ -1214,6 +1275,62 @@ zfs_rewrite(znode_t *zp, uint64_t off, uint64_t len, uint64_t flags,
 			nr += dbp[i]->db_size;
 			if (dmu_buf_is_dirty(dbp[i], tx))
 				continue;
+
+			/*
+			 * Mode 2B safety: if the caller asked for
+			 * force-reencrypt and this dbuf's BP lacks
+			 * BP_USES_CRYPT on an encrypted dataset (the
+			 * corruption shape detected by the scrub check in
+			 * dsl_scan_visitbp - see PR #18587), the on-disk
+			 * bytes may be either genuine ciphertext that lost
+			 * its flag (Mode 1.5 territory; rewriting through
+			 * this path would double-encrypt) or actual
+			 * plaintext that bypassed the encrypt pipeline (the
+			 * Mode 2 case we are recovering). Run a MAC verify
+			 * probe and refuse the rewrite if the bytes verify
+			 * as ciphertext.
+			 */
+			if ((flags & ZFS_REWRITE_FORCE_REENCRYPT) &&
+			    zfsvfs->z_os->os_encrypted) {
+				dmu_buf_impl_t *dbi =
+				    (dmu_buf_impl_t *)dbp[i];
+				blkptr_t *bp = dmu_buf_get_blkptr(dbp[i]);
+				if (bp != NULL && !BP_IS_HOLE(bp) &&
+				    !BP_IS_EMBEDDED(bp) &&
+				    !BP_USES_CRYPT(bp)) {
+					zbookmark_phys_t zb;
+					SET_BOOKMARK(&zb,
+					    dmu_objset_id(zfsvfs->z_os),
+					    zp->z_id, dbi->db_level,
+					    dbi->db_blkid);
+					int verr =
+					    zfs_rewrite_mac_verify_lost_crypt(
+					    spa, bp, &zb);
+					if (verr == 0) {
+						spa_log_error(spa, &zb,
+						    BP_GET_PHYSICAL_BIRTH(bp));
+						zfs_dbgmsg("zfs rewrite "
+						    "--force-reencrypt "
+						    "refusing block at "
+						    "{%llu,%llu,%u,%llu}: "
+						    "MAC verifies, this is "
+						    "a Mode 1.5 candidate "
+						    "(use scrub "
+						    "--repair-crypt-"
+						    "mismatches instead)",
+						    (u_longlong_t)
+						    zb.zb_objset,
+						    (u_longlong_t)
+						    zb.zb_object,
+						    (uint_t)zb.zb_level,
+						    (u_longlong_t)
+						    zb.zb_blkid);
+						error = SET_ERROR(EIO);
+						continue;
+					}
+				}
+			}
+
 			nw += dbp[i]->db_size;
 			if (flags & ZFS_REWRITE_PHYSICAL)
 				dmu_buf_will_rewrite(dbp[i], tx);
@@ -1223,6 +1340,9 @@ zfs_rewrite(znode_t *zp, uint64_t off, uint64_t len, uint64_t flags,
 		dmu_buf_rele_array(dbp, numbufs, FTAG);
 
 		dmu_tx_commit(tx);
+
+		if (error)
+			break;
 
 		len -= n;
 		off += n;

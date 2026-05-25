@@ -32,7 +32,7 @@
 .Sh SYNOPSIS
 .Nm zfs
 .Cm rewrite
-.Oo Fl Prvx Ns Oc
+.Oo Fl EPrvx Ns Oc
 .Op Fl l Ar length
 .Op Fl o Ar offset
 .Ar file Ns | Ns Ar directory Ns …
@@ -45,6 +45,38 @@ as if they were atomically read and written back.
 .No See Sx NOTES .
 for more information about property changes that may be applied during rewrite.
 .Bl -tag -width "-r"
+.It Fl E
+Recover blocks on an encrypted dataset whose block pointer has lost
+.Sy BP_USES_CRYPT
+.Pq the corruption shape detected by scrub's
+.Fl -repair-crypt-mismatches
+flag and described in
+.Xr zpoolconcepts 7 .
+For each affected block the kernel runs a MAC verify probe under the
+dataset key.
+If the bytes verify as ciphertext, the rewrite is refused for that
+block - it would double-encrypt the data; use
+.Nm zpool Cm scrub Fl -repair-crypt-mismatches
+to fix it losslessly instead.
+If the MAC fails, the bytes are treated as plaintext that bypassed
+the encrypt pipeline; they are surfaced to the dbuf layer through
+the
+.Sy DMU_READ_FORCE_LOST_CRYPT
+internal flag and marked dirty, so the normal write pipeline encrypts
+them and produces a fresh block pointer with the CRYPT flag set
+correctly.
+.Pp
+Opt-in only.
+The plaintext-on-encrypted scenario this flag recovers is rare; the
+historical
+.Fn zfs_clone_range
+vector that produced it was fixed in
+.Sy openzfs/zfs#15465 .
+Without this flag,
+.Nm zfs Cm rewrite
+returns
+.Sy EIO
+for affected blocks via the standard dbuf read path.
 .It Fl P
 Perform physical rewrite, preserving logical birth time of blocks.
 By default, rewrite updates logical birth times, making blocks appear
