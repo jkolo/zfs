@@ -2669,7 +2669,8 @@ dsl_scan_crypt_repair_apply_flag(dsl_dataset_t *ds, const blkptr_t *bp,
  *
  * Uses the same atomic parent BP slot lookup as Mode 1.5
  * (dsl_scan_crypt_repair_apply_flag); the difference is the slot
- * mutation - we BP_SET_HOLE() instead of BP_SET_CRYPT().
+ * mutation - we BP_ZERO() the slot (turning the BP into a hole)
+ * instead of just flipping BP_SET_CRYPT().
  */
 static int
 dsl_scan_crypt_repair_free_leaf(dsl_dataset_t *ds, const blkptr_t *bp,
@@ -2704,7 +2705,7 @@ dsl_scan_crypt_repair_free_leaf(dsl_dataset_t *ds, const blkptr_t *bp,
 		rw_enter(&dn->dn_dbuf->db_rwlock, RW_WRITER);
 		dmu_buf_will_dirty(&dn->dn_dbuf->db, tx);
 		parent_slot = DN_SPILL_BLKPTR(dn->dn_phys);
-		BP_SET_HOLE(parent_slot);
+		BP_ZERO(parent_slot);
 		rw_exit(&dn->dn_dbuf->db_rwlock);
 		err = 0;
 	} else if (zb->zb_level + 1 >= dn->dn_phys->dn_nlevels) {
@@ -2715,7 +2716,7 @@ dsl_scan_crypt_repair_free_leaf(dsl_dataset_t *ds, const blkptr_t *bp,
 			dmu_buf_will_dirty(&dn->dn_dbuf->db, tx);
 			parent_slot =
 			    &dn->dn_phys->dn_blkptr[zb->zb_blkid];
-			BP_SET_HOLE(parent_slot);
+			BP_ZERO(parent_slot);
 			rw_exit(&dn->dn_dbuf->db_rwlock);
 			err = 0;
 		}
@@ -2733,7 +2734,7 @@ dsl_scan_crypt_repair_free_leaf(dsl_dataset_t *ds, const blkptr_t *bp,
 			dmu_buf_will_dirty(&parent_db->db, tx);
 			parent_slot = (blkptr_t *)parent_db->db.db_data +
 			    slot_in_parent;
-			BP_SET_HOLE(parent_slot);
+			BP_ZERO(parent_slot);
 			rw_exit(&parent_db->db_rwlock);
 			dbuf_rele(parent_db, FTAG);
 		}
