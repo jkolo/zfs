@@ -31,6 +31,7 @@
 #include <sys/dsl_scan.h>
 #include <sys/dsl_pool.h>
 #include <sys/dsl_dataset.h>
+#include <sys/dsl_crypt.h>
 #include <sys/dsl_prop.h>
 #include <sys/dsl_dir.h>
 #include <sys/dsl_synctask.h>
@@ -2351,6 +2352,60 @@ dsl_scan_visitdnode(dsl_scan_t *scn, dsl_dataset_t *ds,
 }
 
 /*
+ * Decide whether a BP_USES_CRYPT mismatch detected at this bookmark
+ * is a candidate for in-kernel repair (Mode 1.5 smart-flip or Mode 3
+ * free-fallback). The edge cases listed below either require a
+ * different repair path or are unsafe to mutate from scrub sync
+ * context; report-only behaviour (the existing detection block) still
+ * applies in every case.
+ *
+ * Returns B_TRUE iff repair dispatch may proceed; on B_FALSE,
+ * *reason is set to a short static string for use in zfs_dbgmsg.
+ *
+ * The full rationale for each guard is documented in
+ * plans/mode15-23-research.md sections 1.4 and 7.
+ */
+static boolean_t
+dsl_scan_crypt_repair_eligible(const blkptr_t *bp,
+    const zbookmark_phys_t *zb, dsl_dataset_t *ds, const char **reason)
+{
+	if (ds == NULL) {
+		*reason = "MOS object (ds is NULL)";
+		return (B_FALSE);
+	}
+	if (ds->ds_is_snapshot) {
+		*reason = "snapshot dataset (parent BP immutable)";
+		return (B_FALSE);
+	}
+	if (DMU_OBJECT_IS_SPECIAL(zb->zb_object)) {
+		*reason = "special object (dn_dbuf may be NULL)";
+		return (B_FALSE);
+	}
+	if (zb->zb_level == ZB_ZIL_LEVEL) {
+		*reason = "ZIL block (replay-once, MAC layout differs)";
+		return (B_FALSE);
+	}
+	if (BP_GET_TYPE(bp) == DMU_OT_OBJSET) {
+		*reason = "objset block (different MAC API)";
+		return (B_FALSE);
+	}
+	if (BP_IS_GANG(bp)) {
+		*reason = "gang block (complex multi-BP structure)";
+		return (B_FALSE);
+	}
+	if (BP_GET_DEDUP(bp)) {
+		*reason = "dedup BP (DDT key includes CRYPT)";
+		return (B_FALSE);
+	}
+	if (dsl_dataset_get_keystatus(ds->ds_dir) !=
+	    ZFS_KEYSTATUS_AVAILABLE) {
+		*reason = "dataset key unavailable";
+		return (B_FALSE);
+	}
+	return (B_TRUE);
+}
+
+/*
  * The arguments are in this order because mdb can only print the
  * first 5; we want them to be useful.
  */
@@ -2414,6 +2469,42 @@ dsl_scan_visitbp(const blkptr_t *bp, const zbookmark_phys_t *zb,
 			    (u_longlong_t)zb->zb_object,
 			    (uint_t)zb->zb_level,
 			    (u_longlong_t)zb->zb_blkid);
+
+			/*
+			 * When --repair-crypt-mismatches is set, classify
+			 * each mismatch as a Mode 1.5 / Mode 3 candidate or
+			 * report why it is ineligible. The actual repair
+			 * dispatch (smart-flip, free fallback) is wired up
+			 * in a follow-up commit; this block currently only
+			 * records the classification so eligibility can be
+			 * observed via zfs_dbgmsg before the repair path
+			 * goes in.
+			 */
+			if (scn->scn_phys.scn_flags &
+			    DSF_REPAIR_CRYPT_MISMATCHES) {
+				const char *reason = NULL;
+				boolean_t eligible =
+				    dsl_scan_crypt_repair_eligible(bp, zb,
+				    ds, &reason);
+				if (eligible) {
+					zfs_dbgmsg("scrub: BP at "
+					    "{%llu,%llu,%u,%llu} is a "
+					    "crypt-repair candidate",
+					    (u_longlong_t)zb->zb_objset,
+					    (u_longlong_t)zb->zb_object,
+					    (uint_t)zb->zb_level,
+					    (u_longlong_t)zb->zb_blkid);
+				} else {
+					zfs_dbgmsg("scrub: BP at "
+					    "{%llu,%llu,%u,%llu} skipped "
+					    "for crypt repair: %s",
+					    (u_longlong_t)zb->zb_objset,
+					    (u_longlong_t)zb->zb_object,
+					    (uint_t)zb->zb_level,
+					    (u_longlong_t)zb->zb_blkid,
+					    reason);
+				}
+			}
 		}
 	}
 
