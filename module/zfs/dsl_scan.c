@@ -2563,18 +2563,107 @@ dsl_scan_crypt_repair_verify_indirect(spa_t *spa, const blkptr_t *bp,
 }
 
 /*
+ * Mode 1.5 atomic parent BP slot update: restore BP_USES_CRYPT on
+ * the parent's in-memory copy of the BP and mark the parent dirty
+ * so the change is persisted at the next sync. The on-disk BP we
+ * were handed in dsl_scan_visitbp() is read-only and not mutated;
+ * we walk back to the parent dnode/indirect to find the writable
+ * slot that referenced it.
+ *
+ * Three cases per plans/mode15-23-research.md sec. 1.3:
+ *   A. spill block        - slot is DN_SPILL_BLKPTR(dn->dn_phys)
+ *   B. top of object tree - slot is dn->dn_phys->dn_blkptr[blkid]
+ *      (zb_level == nlevels - 1)
+ *   C. deeper levels      - slot is in an indirect block reached
+ *      via dbuf_hold_impl()
+ *
+ * Lock ordering follows the dnode_increase_indirection() pattern
+ * in dnode_sync.c (struct_rwlock READER outside, parent's db_rwlock
+ * WRITER inside, dmu_buf_will_dirty() under the writer).
+ *
+ * Caller must have already confirmed eligibility (ds non-NULL,
+ * non-snapshot, non-special object, MAC-verified, etc.).
+ */
+static int
+dsl_scan_crypt_repair_apply_flag(dsl_dataset_t *ds, const blkptr_t *bp,
+    const zbookmark_phys_t *zb, dmu_tx_t *tx)
+{
+	dnode_t *dn = NULL;
+	blkptr_t *parent_slot;
+	int err;
+
+	(void) bp;
+
+	err = dnode_hold(ds->ds_objset, zb->zb_object, FTAG, &dn);
+	if (err != 0)
+		return (err);
+
+	rw_enter(&dn->dn_struct_rwlock, RW_READER);
+
+	if (dn->dn_dbuf == NULL) {
+		rw_exit(&dn->dn_struct_rwlock);
+		dnode_rele(dn, FTAG);
+		return (SET_ERROR(EINVAL));
+	}
+
+	if (zb->zb_blkid == DMU_SPILL_BLKID) {
+		rw_enter(&dn->dn_dbuf->db_rwlock, RW_WRITER);
+		dmu_buf_will_dirty(&dn->dn_dbuf->db, tx);
+		parent_slot = DN_SPILL_BLKPTR(dn->dn_phys);
+		BP_SET_CRYPT(parent_slot, B_TRUE);
+		rw_exit(&dn->dn_dbuf->db_rwlock);
+		err = 0;
+	} else if (zb->zb_level + 1 >= dn->dn_phys->dn_nlevels) {
+		if (zb->zb_blkid >= dn->dn_phys->dn_nblkptr) {
+			err = SET_ERROR(EINVAL);
+		} else {
+			rw_enter(&dn->dn_dbuf->db_rwlock, RW_WRITER);
+			dmu_buf_will_dirty(&dn->dn_dbuf->db, tx);
+			parent_slot =
+			    &dn->dn_phys->dn_blkptr[zb->zb_blkid];
+			BP_SET_CRYPT(parent_slot, B_TRUE);
+			rw_exit(&dn->dn_dbuf->db_rwlock);
+			err = 0;
+		}
+	} else {
+		dmu_buf_impl_t *parent_db = NULL;
+		int epb_shift = dn->dn_indblkshift - SPA_BLKPTRSHIFT;
+		uint64_t epb = 1ULL << epb_shift;
+		uint64_t parent_blkid = zb->zb_blkid >> epb_shift;
+		uint64_t slot_in_parent = zb->zb_blkid & (epb - 1);
+
+		err = dbuf_hold_impl(dn, zb->zb_level + 1, parent_blkid,
+		    B_FALSE, B_FALSE, FTAG, &parent_db);
+		if (err == 0) {
+			rw_enter(&parent_db->db_rwlock, RW_WRITER);
+			dmu_buf_will_dirty(&parent_db->db, tx);
+			parent_slot = (blkptr_t *)parent_db->db.db_data +
+			    slot_in_parent;
+			BP_SET_CRYPT(parent_slot, B_TRUE);
+			rw_exit(&parent_db->db_rwlock);
+			dbuf_rele(parent_db, FTAG);
+		}
+	}
+
+	rw_exit(&dn->dn_struct_rwlock);
+	dnode_rele(dn, FTAG);
+	return (err);
+}
+
+/*
  * When --repair-crypt-mismatches is set, classify a detected
- * BP_USES_CRYPT mismatch and log the disposition. Atomic repair
- * dispatch lands in a follow-up commit; this helper currently only
- * surfaces the classification via zfs_dbgmsg.
+ * BP_USES_CRYPT mismatch, attempt the Mode 1.5 smart-flip repair if
+ * MAC verifies, and log the outcome. Mode 3 (destructive free
+ * fallback for unrepairable leaves) is handled in a follow-up
+ * commit; this helper currently only classifies it.
  *
  * Called from dsl_scan_visitbp() after the detection block. Both
- * leaf and indirect BPs are handled; indirect Mode 3 is intentionally
- * disabled (would orphan the subtree below).
+ * leaf and indirect BPs are handled; indirect Mode 3 is
+ * intentionally disabled (would orphan the subtree below).
  */
 static void
 dsl_scan_classify_crypt_mismatch(spa_t *spa, const blkptr_t *bp,
-    const zbookmark_phys_t *zb, dsl_dataset_t *ds)
+    const zbookmark_phys_t *zb, dsl_dataset_t *ds, dmu_tx_t *tx)
 {
 	const char *reason = NULL;
 	int verify_err;
@@ -2601,12 +2690,24 @@ dsl_scan_classify_crypt_mismatch(spa_t *spa, const blkptr_t *bp,
 	}
 
 	if (verify_err == 0) {
-		zfs_dbgmsg("scrub: %s BP at {%llu,%llu,%u,%llu} MAC "
-		    "verifies - Mode 1.5 candidate", kind,
-		    (u_longlong_t)zb->zb_objset,
-		    (u_longlong_t)zb->zb_object,
-		    (uint_t)zb->zb_level,
-		    (u_longlong_t)zb->zb_blkid);
+		int apply_err = dsl_scan_crypt_repair_apply_flag(ds, bp,
+		    zb, tx);
+		if (apply_err == 0) {
+			zfs_dbgmsg("scrub: %s BP at {%llu,%llu,%u,%llu} "
+			    "repaired (Mode 1.5 smart flip)", kind,
+			    (u_longlong_t)zb->zb_objset,
+			    (u_longlong_t)zb->zb_object,
+			    (uint_t)zb->zb_level,
+			    (u_longlong_t)zb->zb_blkid);
+		} else {
+			zfs_dbgmsg("scrub: %s BP at {%llu,%llu,%u,%llu} "
+			    "MAC verifies but parent update failed "
+			    "(err %d)", kind,
+			    (u_longlong_t)zb->zb_objset,
+			    (u_longlong_t)zb->zb_object,
+			    (uint_t)zb->zb_level,
+			    (u_longlong_t)zb->zb_blkid, apply_err);
+		}
 	} else if (BP_GET_LEVEL(bp) == 0) {
 		zfs_dbgmsg("scrub: leaf BP at {%llu,%llu,%u,%llu} MAC "
 		    "verify failed (err %d) - Mode 3 candidate",
@@ -2703,7 +2804,7 @@ dsl_scan_visitbp(const blkptr_t *bp, const zbookmark_phys_t *zb,
 			if (scn->scn_phys.scn_flags &
 			    DSF_REPAIR_CRYPT_MISMATCHES) {
 				dsl_scan_classify_crypt_mismatch(
-				    dp->dp_spa, bp, zb, ds);
+				    dp->dp_spa, bp, zb, ds, tx);
 			}
 		}
 	}
