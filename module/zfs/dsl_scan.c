@@ -2406,6 +2406,85 @@ dsl_scan_crypt_repair_eligible(const blkptr_t *bp,
 }
 
 /*
+ * Mode 1.5 leaf MAC verification: attempt to decrypt the leaf BP's
+ * on-disk bytes with the dataset key and check whether the resulting
+ * MAC matches the one stored in blk_cksum's HIGH words.
+ *
+ * If MAC matches, the block is genuinely encrypted ciphertext and
+ * the missing CRYPT flag was lost in flight - this BP is a Mode 1.5
+ * smart-flip candidate (lossless repair just by restoring the flag).
+ *
+ * If MAC fails, the on-disk bytes are not legitimate ciphertext
+ * under this key (could be plaintext, garbage, or encrypted with a
+ * different key). This BP is a Mode 3 free-fallback candidate.
+ *
+ * This is a READ-ONLY probe - no state is mutated. Atomic parent BP
+ * restore happens in a follow-up commit once we have observability
+ * for how often each case actually fires.
+ *
+ * Implementation notes (see plans/mode15-23-research.md sec. 1.1):
+ *   - The original BP has BP_USES_CRYPT clear, which would make
+ *     arc_read treat the on-disk bytes as plaintext and verify the
+ *     normal checksum against blk_cksum - but blk_cksum holds the
+ *     MAC, not a checksum, so checksum verify would fail.
+ *     We sidestep this by passing arc_read a local stack copy of
+ *     the BP with CRYPT forced TRUE: arc_read then takes the
+ *     encrypted-BP path which skips the normal checksum verify.
+ *   - ZIO_FLAG_RAW skips the decrypt pipeline so we receive the raw
+ *     ciphertext.
+ *   - ZIO_FLAG_SPECULATIVE makes IO/cksum errors return as int
+ *     instead of triggering ereports or panics.
+ *   - spa_do_crypt_abd operates on PSIZE (on-disk ciphertext size),
+ *     not LSIZE (decompressed size). The transform stack does
+ *     decrypt-then-decompress, so MAC is computed over PSIZE bytes.
+ *
+ * Returns 0 if MAC matches (Mode 1.5 candidate),
+ * ECKSUM if MAC fails (Mode 3 candidate),
+ * EACCES if the key was unloaded between eligibility check and read,
+ * other errno on IO / setup failures (BP unrepairable this pass).
+ */
+static int
+dsl_scan_crypt_repair_verify_leaf(spa_t *spa, const blkptr_t *bp,
+    const zbookmark_phys_t *zb)
+{
+	blkptr_t bp_with_crypt;
+	arc_buf_t *buf = NULL;
+	arc_flags_t arc_flags = ARC_FLAG_WAIT;
+	int zio_flags = ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE |
+	    ZIO_FLAG_RAW | ZIO_FLAG_SCAN_THREAD;
+	uint64_t psize = BP_GET_PSIZE(bp);
+	uint8_t salt[ZIO_DATA_SALT_LEN];
+	uint8_t iv[ZIO_DATA_IV_LEN];
+	uint8_t mac[ZIO_DATA_MAC_LEN];
+	abd_t *cabd, *pabd;
+	boolean_t no_crypt = B_FALSE;
+	int err;
+
+	bp_with_crypt = *bp;
+	BP_SET_CRYPT(&bp_with_crypt, B_TRUE);
+
+	zio_crypt_decode_params_bp(&bp_with_crypt, salt, iv);
+	zio_crypt_decode_mac_bp(&bp_with_crypt, mac);
+
+	err = arc_read(NULL, spa, &bp_with_crypt, arc_getbuf_func,
+	    &buf, ZIO_PRIORITY_SCRUB, zio_flags, &arc_flags, zb);
+	if (err != 0)
+		return (err);
+
+	cabd = abd_get_from_buf(buf->b_data, psize);
+	pabd = abd_alloc_for_io(psize, B_FALSE);
+
+	err = spa_do_crypt_abd(B_FALSE, spa, zb, BP_GET_TYPE(bp),
+	    BP_GET_DEDUP(bp), BP_SHOULD_BYTESWAP(bp),
+	    salt, iv, mac, psize, pabd, cabd, &no_crypt);
+
+	abd_free(pabd);
+	abd_free(cabd);
+	arc_buf_destroy(buf, &buf);
+	return (err);
+}
+
+/*
  * The arguments are in this order because mdb can only print the
  * first 5; we want them to be useful.
  */
@@ -2486,15 +2565,7 @@ dsl_scan_visitbp(const blkptr_t *bp, const zbookmark_phys_t *zb,
 				boolean_t eligible =
 				    dsl_scan_crypt_repair_eligible(bp, zb,
 				    ds, &reason);
-				if (eligible) {
-					zfs_dbgmsg("scrub: BP at "
-					    "{%llu,%llu,%u,%llu} is a "
-					    "crypt-repair candidate",
-					    (u_longlong_t)zb->zb_objset,
-					    (u_longlong_t)zb->zb_object,
-					    (uint_t)zb->zb_level,
-					    (u_longlong_t)zb->zb_blkid);
-				} else {
+				if (!eligible) {
 					zfs_dbgmsg("scrub: BP at "
 					    "{%llu,%llu,%u,%llu} skipped "
 					    "for crypt repair: %s",
@@ -2503,6 +2574,47 @@ dsl_scan_visitbp(const blkptr_t *bp, const zbookmark_phys_t *zb,
 					    (uint_t)zb->zb_level,
 					    (u_longlong_t)zb->zb_blkid,
 					    reason);
+				} else if (BP_GET_LEVEL(bp) == 0) {
+					int verify_err =
+					    dsl_scan_crypt_repair_verify_leaf(
+					    dp->dp_spa, bp, zb);
+					if (verify_err == 0) {
+						zfs_dbgmsg("scrub: BP at "
+						    "{%llu,%llu,%u,%llu} "
+						    "MAC verifies - "
+						    "Mode 1.5 candidate",
+						    (u_longlong_t)
+						    zb->zb_objset,
+						    (u_longlong_t)
+						    zb->zb_object,
+						    (uint_t)zb->zb_level,
+						    (u_longlong_t)
+						    zb->zb_blkid);
+					} else {
+						zfs_dbgmsg("scrub: BP at "
+						    "{%llu,%llu,%u,%llu} "
+						    "MAC verify failed "
+						    "(err %d) - Mode 3 "
+						    "candidate",
+						    (u_longlong_t)
+						    zb->zb_objset,
+						    (u_longlong_t)
+						    zb->zb_object,
+						    (uint_t)zb->zb_level,
+						    (u_longlong_t)
+						    zb->zb_blkid,
+						    verify_err);
+					}
+				} else {
+					zfs_dbgmsg("scrub: BP at "
+					    "{%llu,%llu,%u,%llu} indirect "
+					    "level repair not yet "
+					    "implemented (Mode 1.5 "
+					    "MAC-of-MAC verify pending)",
+					    (u_longlong_t)zb->zb_objset,
+					    (u_longlong_t)zb->zb_object,
+					    (uint_t)zb->zb_level,
+					    (u_longlong_t)zb->zb_blkid);
 				}
 			}
 		}
